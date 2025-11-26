@@ -1,0 +1,16 @@
+<launch>
+    <param name="/use_sim_time" value="true" />
+    <arg name="model" default="burger" doc="model type [burger, waffle, waffle_pi]"/>
+    <include file="$(find turtlebot3_gazebo)/launch/turtlebot3_world.launch">
+    </include>
+
+    <include file="$(find turtlebot3_bringup)/launch/turtlebot3_remote.launch">
+    </include>
+
+    <node pkg="tf" type="static_transform_publisher" name="map_odom_broadcaster" args="0 0 0 0 0 0 map odom 100" />
+
+    <node pkg="simple_mppi" type="mppi_node.py" name="mppi_controller" output="screen" />
+
+    <node pkg="rviz" type="rviz" name="rviz" args="-d $(find simple_mppi)/rviz/mppi.rviz" />
+
+</launch>
