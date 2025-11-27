@@ -1,0 +1,28 @@
+<launch>
+    <param name="/use_sim_time" value="true" />
+
+    <arg name="model" default="burger" doc="model type [burger, waffle, waffle_pi]"/>
+    
+    <!-- Gazebo TurtleBot3 World -->
+    <include file="$(find turtlebot3_gazebo)/launch/turtlebot3_world.launch"/>
+
+    <!-- TurtleBot3 Bringup -->
+    <include file="$(find turtlebot3_bringup)/launch/turtlebot3_remote.launch"/>
+
+    <!-- TF: map -> odom -->
+    <node pkg="tf" type="static_transform_publisher" name="map_odom_broadcaster" 
+          args="0 0 0 0 0 0 map odom 100" />
+
+    <!-- 静态地图服务器 -->
+    <node name="map_server" pkg="map_server" type="map_server" 
+          args="$(find turtlebot3_navigation)/maps/map.yaml">
+        <param name="frame_id" value="map"/>
+    </node>
+
+    <!-- 三层架构控制器 -->
+    <node name="three_layer_controller" pkg="simple_mppi" type="mpc_three_layer.py" output="screen"/>
+
+    <!-- RViz -->
+    <node name="rviz" pkg="rviz" type="rviz" 
+          args="-d $(find simple_mppi)/rviz/three_layer.rviz"/>
+</launch>

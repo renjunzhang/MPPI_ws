@@ -6,7 +6,6 @@ Panels:
       Expanded:
         - /Global Options1
         - /Status1
-        - /Marker2
       Splitter Ratio: 0.5
     Tree Height: 448
   - Class: rviz/Selection
@@ -54,11 +53,11 @@ Visualization Manager:
       Value: true
     - Class: rviz/MarkerArray
       Enabled: true
-      Marker Topic: /mppi_paths
+      Marker Topic: /mpc_paths
       Name: MarkerArray
       Namespaces:
-        mppi_optimal: true
-        mppi_points: true
+        mpc_optimal: true
+        mpc_points: true
       Queue Size: 100
       Value: true
     - Alpha: 1
@@ -227,4 +226,4 @@ Window Geometry:
     collapsed: false
   Width: 1470
   X: 450
-  Y: 144
+  Y: 103
