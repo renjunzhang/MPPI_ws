@@ -21,7 +21,7 @@ import rospy
 from pytorch_mppi import MPPI
 
 class MPPITracker:
-    def __init__(self, dt=0.1, N=30):
+    def __init__(self, dt=0.1, N=60):
         """
         初始化 MPPI 跟踪器
         Args:
@@ -52,10 +52,22 @@ class MPPITracker:
         # 噪声设置: [v_sigma, w_sigma]
         # w 的噪声大一点，允许它大幅度尝试转向
         # 必须显式指定 float32
-        noise_sigma = torch.tensor([[0.08, 0.0], [0.0, 0.8]], device=self.device, dtype=torch.float32)
+        noise_sigma = torch.tensor([[0.05, 0.0], [0.0, 0.5]], device=self.device, dtype=torch.float32)
         
         # Lambda: 温度系数，越小越贪婪(只选最好的)，越大越平滑(平均)
         self.lambda_ = 0.02 
+
+        # --- 4. APF 参数（吸引 + 斥力）---
+        self.use_apf = rospy.get_param("~use_apf", True)
+
+        self.apf_k_att = rospy.get_param("~apf_k_att", 160.0)
+        self.apf_eta   = rospy.get_param("~apf_eta", 1.0)
+        self.apf_d0    = rospy.get_param("~apf_d0", 0.6)
+
+        rospy.loginfo(f"[MPPITracker] APF enabled={self.use_apf}, "
+                      f"k_att={self.apf_k_att}, eta={self.apf_eta}, d0={self.apf_d0}")
+
+
         
         # 初始化求解器
         self.mppi = MPPI(self._dynamics, self._running_cost, nx=3, 
@@ -91,12 +103,14 @@ class MPPITracker:
 
     def _running_cost(self, state, action):
         """ 
-        修正版代价函数：适配 (K, 3) 输入维度，修复索引错误
+        MPPI + APF 融合的运行代价：
+        - 吸引势：靠近参考轨迹（min_dist）
+        - 斥力势：远离障碍物（最近障碍距离）
+        - 再加上速度/角速度等控制项
+        state:  (K, 3)
+        action: (K, 2)
         """
-        # --- 1. 维度修正 ---
-        # state 现在的形状是 (K, 3)，不是 (K, N, 3)
-        # action 现在的形状是 (K, 2)
-        
+        # 1. 拆状态和动作
         x = state[:, 0]
         y = state[:, 1]
         theta = state[:, 2]
@@ -104,59 +118,75 @@ class MPPITracker:
         v = action[:, 0]
         w = action[:, 1]
         
-        # --- 2. 计算与参考轨迹的最近距离 (Path Following) ---
+        # 2. 计算到参考轨迹的最近距离（吸引势的“目标”）
         # state_pos: (K, 1, 2)
         state_pos = state[:, :2].unsqueeze(1)
         # ref_pos: (1, N, 2)
         ref_pos = self.ref_traj_tensor[:, :2].unsqueeze(0)
         
-        # 计算距离矩阵 (K, N) -> 每个采样点到所有参考点的距离
-        # 这一步利用广播机制，计算量稍大但 GPU 扛得住
-        dists_sq = torch.sum((state_pos - ref_pos)**2, dim=2) # (K, N)
-        
-        # 找到最近点的索引和距离
-        min_dist_sq, min_indices = torch.min(dists_sq, dim=1) # (K,)
-        
-        # --- 3. 提取匹配点的参考信息 ---
-        # 根据最近点的索引，找出对应的参考速度和角度
-        # self.ref_traj_tensor 是 (N, 4) -> [x, y, theta, v]
-        
-        # 使用索引直接提取匹配的参考点
-        matched_ref = self.ref_traj_tensor[min_indices] # (K, 4)
-        
+        # 距离矩阵 (K, N)
+        dists_sq = torch.sum((state_pos - ref_pos)**2, dim=2)
+        # 最近点索引 & 距离
+        min_dist_sq, min_indices = torch.min(dists_sq, dim=1)  # (K,)
+
+        # 对应的参考点（包括 theta, v）
+        matched_ref = self.ref_traj_tensor[min_indices]  # (K, 4)
         ref_theta = matched_ref[:, 2]
         ref_v = matched_ref[:, 3]
         
-        # --- 4. 计算各项代价 ---
+        # 3. APF 吸引势：偏离轨迹的惩罚
+        #    U_att = 0.5 * k_att * ||p - p_ref||^2
+        cost_pos = 0.5 * self.apf_k_att * min_dist_sq
         
-        # A. 位置代价 (Cross Track Error)
-        cost_pos = min_dist_sq * 60.0
-        
-        # B. 朝向代价 (Angle Error - 修复绕圈问题)
-        # 使用 1-cos 处理角度跳变
-        delta_theta = theta - ref_theta
+        # 4. 姿态误差代价（保持原有形式）
+        delta_theta = torch.atan2(
+            torch.sin(theta - ref_theta),
+            torch.cos(theta - ref_theta)
+        )
         cost_angle = (1.0 - torch.cos(delta_theta)) * 80.0
         
-        # C. 速度代价 (Tracking Speed)
-        cost_v = (v - ref_v)**2 * 10.0
+        # 5. 速度跟踪 + 控制代价
+        cost_v = (v - ref_v) ** 2 * 10.0
+        cost_w = (w ** 2) * 0.8
         
-        # D. 动作平滑与约束
-        cost_w = (w**2) * 0.8
-        
-        # E. 障碍物代价 (如果有)
+        # 6. APF 斥力势：最近障碍物
         cost_obs = torch.zeros_like(cost_pos)
         if self.obstacle_points is not None and len(self.obstacle_points) > 0:
-            obs_pos = self.obstacle_points.unsqueeze(0) # (1, M, 2)
-            # 计算到所有障碍物的距离
-            obs_dists_sq = torch.sum((state_pos - obs_pos)**2, dim=2) # (K, M)
-            # 最近障碍物
+            # obs_pos: (1, M, 2)
+            obs_pos = self.obstacle_points.unsqueeze(0)
+            # 每个采样点到所有障碍物的距离平方 (K, M)
+            obs_dists_sq = torch.sum((state_pos - obs_pos) ** 2, dim=2)
+            # 最近障碍距离
             min_obs_dist_sq, _ = torch.min(obs_dists_sq, dim=1)
-            min_obs_dist = torch.sqrt(min_obs_dist_sq)
+            # 防止 sqrt(0)
+            min_obs_dist = torch.sqrt(torch.clamp(min_obs_dist_sq, min=1e-6))
             
-            safe_margin = 0.1
-            cost_obs = torch.clamp(safe_margin - min_obs_dist, min=0) * 40.0
+            d0 = self.apf_d0   # 影响范围
+            eta = self.apf_eta # 斥力强度
+            
+            # 只在 d <= d0 时产生斥力势
+            inside = min_obs_dist < d0  # (K,)
+            
+            # 1/d - 1/d0，数值稳定起见用 where
+            inv_d = torch.where(
+                inside,
+                1.0 / min_obs_dist,
+                torch.zeros_like(min_obs_dist)
+            )
+            diff = inv_d - 1.0 / d0
+            U_rep = 0.5 * eta * diff * diff  # (K,)
+            
+            cost_obs = torch.where(inside, U_rep, torch.zeros_like(U_rep))
+        
+        total_cost = cost_pos + cost_angle + cost_v + cost_w
 
-        return cost_pos + cost_angle + cost_v + cost_w + cost_obs
+        if self.use_apf:
+            total_cost = total_cost + cost_obs   # cost_obs 就是斥力势
+
+        return total_cost
+
+    
+
 
     def solve(self, current_state, reference_window, obstacles_list=None):
         """
