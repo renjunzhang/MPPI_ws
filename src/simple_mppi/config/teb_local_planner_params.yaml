@@ -1,0 +1,62 @@
+TebLocalPlannerROS:
+
+  odom_topic: odom
+  map_frame: /odom # 在仿真中，如果没有 map，这里填 odom 也能跑
+
+  # --- 1. 机器人限制 (Robot) ---
+  max_vel_x: 0.22           # 你的 Burger 极限速度
+  max_vel_x_backwards: 0.15 # TEB 的杀手锏：支持倒车！
+  max_vel_theta: 2.75
+  acc_lim_x: 2.5
+  acc_lim_theta: 3.2
+
+  # 机器人形状 (避障的核心)
+  # Burger 近似为一个半径 0.105 的圆
+  footprint_model: 
+    type: "circular"
+    radius: 0.105
+
+  # --- 2. 目标容差 (Goal Tolerance) ---
+  xy_goal_tolerance: 0.10
+  yaw_goal_tolerance: 0.10
+  free_goal_vel: False # 到达终点必须停车，不能冲过去
+
+  # --- 3. 轨迹配置 (Trajectory) ---
+  dt_ref: 0.3            # 轨迹分辨率：每 0.3秒 一个点
+  dt_hysteresis: 0.1     # 滞后处理，防止重规划太频繁
+  min_samples: 3         # 至少规划 3 个点
+  global_plan_overwrite_orientation: True # 使用全局路径的朝向初始化
+  max_global_plan_lookahead_dist: 3.0     # 只看前方 3米 的全局路径(滑动窗口)
+  feasibility_check_no_poses: 5           # 检查生成的轨迹是否真的可行
+
+  # --- 4. 障碍物 (Obstacles) ---
+  min_obstacle_dist: 0.20 # 最小安全距离 (除了半径外还要留 0.2m)
+  include_costmap_obstacles: True # 读取 ROS 代价地图
+  costmap_obstacles_behind_robot_dist: 1.0 # 也要看身后的障碍物(为了倒车)
+  obstacle_poses_affected: 30 # 障碍物会影响附近的多少个轨迹点
+
+  # --- 5. 优化权重 (Optimization) ---
+  # 这里的权重决定了机器人的性格
+  no_inner_iterations: 5
+  no_outer_iterations: 4
+  optimization_activate: True
+  optimization_verbose: False
+  penalty_epsilon: 0.1
+  weight_max_vel_x: 2
+  weight_max_vel_theta: 1
+  weight_acc_lim_x: 1
+  weight_acc_lim_theta: 1
+  weight_kinematics_nh: 1000 # 非完整约束权重：非常大，强迫满足差速模型(不能横移)
+  weight_kinematics_forward_drive: 1 # 倒车惩罚：设为 1 允许倒车；设为 1000 禁止倒车
+  weight_optimaltime: 1 # 时间最优权重：设得越大，车开得越猛(切内道)
+  weight_obstacle: 50   # 避障权重：越大越怕死
+  
+  # --- 6. 并行规划 (Homotopy Class) ---
+  # TEB 可以同时算好几条路(左边绕、右边绕)，选最好的
+  enable_homotopy_class_planning: True
+  enable_multithreading: True
+  max_number_classes: 2 # 最多维护 2 条备选路径
+  selection_cost_hysteresis: 1.0
+  selection_prefer_initial_plan: 0.95
+  selection_obst_cost_scale: 1.0
+  selection_alternative_time_cost: False

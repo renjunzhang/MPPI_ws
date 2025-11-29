@@ -9,6 +9,12 @@
 
     <node pkg="tf" type="static_transform_publisher" name="map_odom_broadcaster" args="0 0 0 0 0 0 map odom 100" />
 
+    <!-- 静态地图服务器 -->
+    <node name="map_server" pkg="map_server" type="map_server" 
+          args="$(find turtlebot3_navigation)/maps/map.yaml">
+        <param name="frame_id" value="map"/>
+    </node>
+
     <node pkg="simple_mppi" type="mppi_node.py" name="mppi_controller" output="screen" />
 
     <node pkg="rviz" type="rviz" name="rviz" args="-d $(find simple_mppi)/rviz/mppi.rviz" />

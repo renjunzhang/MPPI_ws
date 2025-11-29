@@ -1,381 +1,225 @@
 #!/usr/bin/env python3
-import rospy
+"""
+MPPI 轨迹跟踪模块 (适配三层架构 - 修复版)
+======================================
+基于 pytorch_mppi 的轨迹跟踪器
+
+功能:
+    - 适配 Layer 2 传来的参考轨迹窗口
+    - 使用 GPU 并行采样寻找最优控制量
+    - 接口与 MPCTracker 保持一致 (Drop-in Replacement)
+    - 修复了数据类型错误和维度索引错误
+
+依赖: torch, pytorch_mppi
+
+作者: GitHub Copilot & User
+"""
+
 import torch
 import numpy as np
-from geometry_msgs.msg import Twist, PoseStamped, Point
-from nav_msgs.msg import Odometry
-from sensor_msgs.msg import LaserScan
-from visualization_msgs.msg import Marker, MarkerArray
-from tf.transformations import euler_from_quaternion
+import rospy
 from pytorch_mppi import MPPI
 
-class MPPIController:
-    def __init__(self):
-        rospy.init_node('mppi_controller')
+class MPPITracker:
+    def __init__(self, dt=0.1, N=30):
+        """
+        初始化 MPPI 跟踪器
+        Args:
+            dt: 控制周期 (s)
+            N: 预测步数 (MPPI 的 horizon)
+        """
+        self.dt = dt
+        self.N = N  # Horizon
         
         # --- 1. 硬件配置 ---
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        rospy.loginfo(f"MPPI running on: {self.device}")
+        rospy.loginfo(f"[MPPITracker] Running on: {self.device}")
         
-        # --- 2. 状态变量 ---
-        self.goal_pos = None  # 初始没有目标
-        self.current_state = None # [x, y, yaw]
-        self.obstacle_points = []  # 存储激光雷达检测到的障碍物点
-        self.last_action = torch.zeros(2, device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))  # 上一次的控制量，用于平滑
+        # --- 2. 内部变量 ---
+        self.obstacle_points = None # 存储障碍物 Tensor
+        
+        # 上一次的控制量，用于平滑
+        self.last_action = torch.zeros(2, device=self.device, dtype=torch.float32)
+        
+        # 参考轨迹 Tensor (Horizon, 4) -> [x, y, theta, v]
+        # 必须显式指定 float32 防止类型冲突
+        self.ref_traj_tensor = torch.zeros((self.N, 4), device=self.device, dtype=torch.float32)
         
         # --- 3. MPPI 参数配置 ---
-        self.v_max = 0.5  # 降低最大速度防止过冲
-        self.w_max = 0.8  # 降低最大角速度使转向更平滑
+        self.v_max = 0.22  # TurtleBot3 物理极限
+        self.w_max = 2.0
         
-        # 减小噪声使轨迹更平滑
-        noise_sigma = torch.tensor([[0.08, 0.0], [0.0, 0.6]], device=self.device)
+        # 噪声设置: [v_sigma, w_sigma]
+        # w 的噪声大一点，允许它大幅度尝试转向
+        # 必须显式指定 float32
+        noise_sigma = torch.tensor([[0.08, 0.0], [0.0, 0.8]], device=self.device, dtype=torch.float32)
         
-        self.mppi = MPPI(self.dynamics, self.running_cost, nx=3, 
+        # Lambda: 温度系数，越小越贪婪(只选最好的)，越大越平滑(平均)
+        self.lambda_ = 0.02 
+        
+        # 初始化求解器
+        self.mppi = MPPI(self._dynamics, self._running_cost, nx=3, 
                          noise_sigma=noise_sigma,
-                         num_samples=1000,  # 增加采样数提高规划质量
-                         horizon=50,        # 增加预测视野
-                         lambda_=1.0,       # 温度参数，越大越平滑
+                         num_samples=1000,    # 采样数 1000
+                         horizon=self.N,     # 预测视野
                          device=self.device,
-                         u_min=torch.tensor([0.0, -self.w_max], device=self.device),
-                         u_max=torch.tensor([self.v_max, self.w_max], device=self.device))
+                         lambda_=self.lambda_,
+                         u_min=torch.tensor([-0.05, -self.w_max], device=self.device, dtype=torch.float32),
+                         u_max=torch.tensor([self.v_max, self.w_max], device=self.device, dtype=torch.float32))
         
-        # --- 4. ROS 接口 ---
-        self.pub_cmd = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
-        self.pub_markers = rospy.Publisher('/mppi_paths', MarkerArray, queue_size=1)
-        self.pub_goal_marker = rospy.Publisher('/goal_marker', Marker, queue_size=1)
-        self.pub_obstacle_markers = rospy.Publisher('/obstacle_markers', MarkerArray, queue_size=1)
-        self.pub_robot_marker = rospy.Publisher('/robot_marker', Marker, queue_size=1)
-        
-        rospy.Subscriber('/move_base_simple/goal', PoseStamped, self.goal_cb)
-        rospy.Subscriber('/odom', Odometry, self.odom_cb)
-        rospy.Subscriber('/scan', LaserScan, self.scan_cb)  # 订阅激光雷达
-        
-        # 定时器 20Hz
-        self.timer = rospy.Timer(rospy.Duration(0.05), self.control_loop)
-        
-        rospy.loginfo("MPPI Controller Ready. Waiting for Goal via RViz...")
+        rospy.loginfo("[MPPITracker] Initialized")
 
-    # ==========================================
-    # 核心算法部分 (现在都在类里面了)
-    # ==========================================
-    
-    def dynamics(self, state, action):
-        """ 差速机器人动力学模型 """
+    def _dynamics(self, state, action):
+        """
+        差速机器人动力学 (Batch Parallel)
+        state: (K, 3) -> x, y, theta
+        action: (K, 2) -> v, w
+        """
         x = state[:, 0]
         y = state[:, 1]
         theta = state[:, 2]
         
         v = action[:, 0]
         w = action[:, 1]
-        dt = 0.05
         
-        new_x = x + v * torch.cos(theta) * dt
-        new_y = y + v * torch.sin(theta) * dt
-        new_theta = theta + w * dt
+        # 简单的欧拉积分
+        new_x = x + v * torch.cos(theta) * self.dt
+        new_y = y + v * torch.sin(theta) * self.dt
+        new_theta = theta + w * self.dt
         
         return torch.stack((new_x, new_y, new_theta), dim=1)
 
-    def running_cost(self, state, action):
-            """ 代价函数 """
-            x = state[:, 0]
-            y = state[:, 1]
-            theta = state[:, 2]
-            v = action[:, 0] # 获取线速度
-            
-            # --- 1. 目标代价 ---
-            if self.goal_pos is not None:
-                dx = self.goal_pos[0] - x  # 目标 - 当前
-                dy = self.goal_pos[1] - y
-                dist_to_goal = torch.sqrt(dx**2 + dy**2 + 1e-6)
-                
-                # 距离代价 - 增大权重
-                cost_goal_dist = dist_to_goal * 5.0
-                
-                # 朝向代价 - 鼓励朝向目标
-                desired_angle = torch.atan2(dy, dx)
-                angle_diff = torch.remainder(desired_angle - theta + np.pi, 2*np.pi) - np.pi
-                cost_goal_heading = torch.abs(angle_diff) * 3.0
-                
-                cost_goal = cost_goal_dist + cost_goal_heading
-            else:
-                dist_to_goal = torch.zeros_like(x)
-                cost_goal = torch.zeros_like(x)
-                
-            # --- 2. 障碍物代价 (基于激光雷达) ---
-            cost_obs = torch.zeros_like(x)
-            safe_margin = 0.35  # 安全距离
-            
-            # 遍历所有检测到的障碍物点
-            for obs_x, obs_y in self.obstacle_points:
-                dist_to_obs = torch.sqrt((x - obs_x)**2 + (y - obs_y)**2 + 1e-6)
-                # 分段惩罚
-                penetration = torch.clamp(safe_margin - dist_to_obs, min=0)
-                cost_obs = cost_obs + (penetration ** 2) * 300.0
-            
-            # --- 3. 控制平滑代价 ---
-            # 增大角速度惩罚使转向更平滑
-            cost_ctrl = (v**2 * 0.02 + action[:, 1]**2 * 0.1)
-            
-            # --- 4. 角速度变化率惩罚 (使轨迹更平滑) ---
-            # 惩罚角速度的大幅变化
-            w_rate_penalty = (action[:, 1] - self.last_action[1].item())**2 * 0.3
-
-            # --- 5. 终点减速逻辑 (优化：增大减速区域防止过冲) ---
-            # 扩大减速区域，增大减速权重
-            near_goal_mask = (dist_to_goal < 0.5).float()
-            cost_stop = near_goal_mask * (v**2) * 15.0
-            
-            # 极近目标时更强的减速
-            very_near_mask = (dist_to_goal < 0.2).float()
-            cost_stop = cost_stop + very_near_mask * (v**2) * 30.0 
-            
-            return cost_goal + cost_obs + cost_ctrl + w_rate_penalty + cost_stop
-
-    # ==========================================
-    # 回调函数
-    # ==========================================
-    
-    def odom_cb(self, msg):
-        x = msg.pose.pose.position.x
-        y = msg.pose.pose.position.y
-        q = msg.pose.pose.orientation
-        (_, _, yaw) = euler_from_quaternion([q.x, q.y, q.z, q.w])
-        self.current_state = torch.tensor([x, y, yaw], device=self.device)
-
-    def goal_cb(self, msg):
-        # 收到新目标时，更新目标点
-        gx = msg.pose.position.x
-        gy = msg.pose.position.y
-        self.goal_pos = torch.tensor([gx, gy], device=self.device)
-        rospy.loginfo(f"New Goal Received: [{gx:.2f}, {gy:.2f}]")
-
-    def scan_cb(self, msg):
-        """ 处理激光雷达数据，转换为世界坐标系中的障碍物点 """
-        if self.current_state is None:
-            return
+    def _running_cost(self, state, action):
+        """ 
+        修正版代价函数：适配 (K, 3) 输入维度，修复索引错误
+        """
+        # --- 1. 维度修正 ---
+        # state 现在的形状是 (K, 3)，不是 (K, N, 3)
+        # action 现在的形状是 (K, 2)
         
-        # 获取当前位姿
-        x = self.current_state[0].item()
-        y = self.current_state[1].item()
-        theta = self.current_state[2].item()
+        x = state[:, 0]
+        y = state[:, 1]
+        theta = state[:, 2]
         
-        obstacle_points = []
-        angle = msg.angle_min
+        v = action[:, 0]
+        w = action[:, 1]
         
-        # 只取部分点降低计算量（每隔10个点取一个）
-        for i, r in enumerate(msg.ranges):
-            if i % 10 == 0 and msg.range_min < r < msg.range_max:
-                # 转换到世界坐标系
-                obs_x = x + r * np.cos(theta + angle)
-                obs_y = y + r * np.sin(theta + angle)
-                
-                # 只保留2米内的障碍物点
-                if r < 2.0:
-                    obstacle_points.append((obs_x, obs_y))
+        # --- 2. 计算与参考轨迹的最近距离 (Path Following) ---
+        # state_pos: (K, 1, 2)
+        state_pos = state[:, :2].unsqueeze(1)
+        # ref_pos: (1, N, 2)
+        ref_pos = self.ref_traj_tensor[:, :2].unsqueeze(0)
+        
+        # 计算距离矩阵 (K, N) -> 每个采样点到所有参考点的距离
+        # 这一步利用广播机制，计算量稍大但 GPU 扛得住
+        dists_sq = torch.sum((state_pos - ref_pos)**2, dim=2) # (K, N)
+        
+        # 找到最近点的索引和距离
+        min_dist_sq, min_indices = torch.min(dists_sq, dim=1) # (K,)
+        
+        # --- 3. 提取匹配点的参考信息 ---
+        # 根据最近点的索引，找出对应的参考速度和角度
+        # self.ref_traj_tensor 是 (N, 4) -> [x, y, theta, v]
+        
+        # 使用索引直接提取匹配的参考点
+        matched_ref = self.ref_traj_tensor[min_indices] # (K, 4)
+        
+        ref_theta = matched_ref[:, 2]
+        ref_v = matched_ref[:, 3]
+        
+        # --- 4. 计算各项代价 ---
+        
+        # A. 位置代价 (Cross Track Error)
+        cost_pos = min_dist_sq * 60.0
+        
+        # B. 朝向代价 (Angle Error - 修复绕圈问题)
+        # 使用 1-cos 处理角度跳变
+        delta_theta = theta - ref_theta
+        cost_angle = (1.0 - torch.cos(delta_theta)) * 80.0
+        
+        # C. 速度代价 (Tracking Speed)
+        cost_v = (v - ref_v)**2 * 10.0
+        
+        # D. 动作平滑与约束
+        cost_w = (w**2) * 0.8
+        
+        # E. 障碍物代价 (如果有)
+        cost_obs = torch.zeros_like(cost_pos)
+        if self.obstacle_points is not None and len(self.obstacle_points) > 0:
+            obs_pos = self.obstacle_points.unsqueeze(0) # (1, M, 2)
+            # 计算到所有障碍物的距离
+            obs_dists_sq = torch.sum((state_pos - obs_pos)**2, dim=2) # (K, M)
+            # 最近障碍物
+            min_obs_dist_sq, _ = torch.min(obs_dists_sq, dim=1)
+            min_obs_dist = torch.sqrt(min_obs_dist_sq)
             
-            angle += msg.angle_increment
+            safe_margin = 0.1
+            cost_obs = torch.clamp(safe_margin - min_obs_dist, min=0) * 40.0
+
+        return cost_pos + cost_angle + cost_v + cost_w + cost_obs
+
+    def solve(self, current_state, reference_window, obstacles_list=None):
+        """
+        执行 MPPI 求解
+        Args:
+            current_state: [x, y, theta]
+            reference_window: 参考轨迹列表 (Layer 2 Output)
+            obstacles_list: [(x, y), ...] 障碍物列表 (Global input)
+        Returns:
+            control: [v, w]
+            predicted_traj: 预测轨迹用于可视化
+        """
+        # 1. 更新参考轨迹 Tensor
+        ref_len = len(reference_window)
+        for i in range(self.N):
+            idx = min(i, ref_len - 1)
+            pt = reference_window[idx]
+            
+            self.ref_traj_tensor[i, 0] = pt['x']
+            self.ref_traj_tensor[i, 1] = pt['y']
+            self.ref_traj_tensor[i, 2] = pt['theta']
+            # 新增：把速度也存进去！
+            self.ref_traj_tensor[i, 3] = pt['v'] 
+            
+        # 2. 更新障碍物 Tensor
+        if obstacles_list is not None and len(obstacles_list) > 0:
+            # 必须显式指定 float32
+            self.obstacle_points = torch.tensor(obstacles_list, device=self.device, dtype=torch.float32)
+        else:
+            self.obstacle_points = None
+
+        # 3. 准备状态
+        curr_state_tensor = torch.tensor(current_state, dtype=torch.float32, device=self.device)
         
-        self.obstacle_points = obstacle_points
-
-    def control_loop(self, event):
-        # 1. 安全检查
-        if self.current_state is None:
-            rospy.logwarn_throttle(2.0, "Waiting for odom data...")
-            return
-
-        # 2. 待命检查：如果没有目标，强制停车
-        if self.goal_pos is None:
-            # 发送0速度，防止滑动
-            stop = Twist()
-            self.pub_cmd.publish(stop)
-            rospy.loginfo_throttle(5.0, "No goal set. Waiting for goal...")
-            return
+        # 4. MPPI 求解
+        action = self.mppi.command(curr_state_tensor)
         
-        # ==========================================
-        # 3. 新增：到达检测逻辑 (Arrival Check)
-        # ==========================================
-        # 计算当前位置到目标的距离
-        dx = self.goal_pos[0] - self.current_state[0]
-        dy = self.goal_pos[1] - self.current_state[1]
-        dist_to_goal = torch.sqrt(dx**2 + dy**2).item() # 转成 python float
-
-        # 设定容差阈值 (例如 0.15米)
-        if dist_to_goal < 0.15:
-            rospy.loginfo("Goal Reached! Stopping.")
-            self.goal_pos = None  # 清除目标，进入待命状态
-            self.stop_robot()     # 强制停车
-            return
-        # ==========================================
-
-        # 3. 计算 MPPI
-        action = self.mppi.command(self.current_state)
-        
-        # 保存当前动作用于下一次平滑计算
+        # 5. 更新内部状态
         self.last_action = action.clone()
         
-        # 4. 发布命令
-        cmd = Twist()
-        cmd.linear.x = action[0].item()
-        cmd.angular.z = action[1].item()
-        self.pub_cmd.publish(cmd)
+        # 6. 提取结果
+        v = action[0].item()
+        w = action[1].item()
         
-        # 5. 可视化
-        self.visualize_trajectories()
-        self.visualize_goal()
-        self.visualize_obstacles()
-        self.visualize_robot()
+        # 7. 生成预测轨迹 (用于可视化)
+        pred_traj = self._predict_trajectory(curr_state_tensor)
+        
+        return np.array([v, w]), pred_traj
 
-    # 辅助函数：停车
-    def stop_robot(self):
-        cmd = Twist()
-        cmd.linear.x = 0.0
-        cmd.angular.z = 0.0
-        self.pub_cmd.publish(cmd)
-
-    def visualize_trajectories(self):
+    def _predict_trajectory(self, start_state):
+        """ 使用最优控制序列推演预测轨迹 """
+        traj = []
+        state = start_state.clone()
         U = self.mppi.U
-        if U is None: return
         
-        ma = MarkerArray()
-        
-        # --- 最优轨迹 (红色粗线) ---
-        state = self.current_state.clone()
-        path_points = [Point(x=state[0].item(), y=state[1].item(), z=0.0)]
-        
-        for t in range(U.shape[0]):
-            state = self.dynamics(state.unsqueeze(0), U[t].unsqueeze(0)).squeeze(0)
-            path_points.append(Point(x=state[0].item(), y=state[1].item(), z=0.0))
+        for i in range(min(self.N, U.shape[0])):
+            act = U[i]
+            # 扩展维度适配 dynamics (Batch=1)
+            next_s = self._dynamics(state.unsqueeze(0), act.unsqueeze(0)).squeeze(0)
+            state = next_s
+            traj.append([state[0].item(), state[1].item(), state[2].item()])
+        return traj
 
-        marker = Marker()
-        marker.header.frame_id = "odom"
-        marker.header.stamp = rospy.Time.now()
-        marker.ns = "mppi_optimal"
-        marker.id = 0
-        marker.type = Marker.LINE_STRIP
-        marker.action = Marker.ADD
-        marker.scale.x = 0.08  # 加粗线条
-        marker.color.a = 1.0
-        marker.color.r = 1.0
-        marker.color.g = 0.2
-        marker.color.b = 0.0
-        marker.pose.orientation.w = 1.0
-        marker.points = path_points
-        ma.markers.append(marker)
-        
-        # --- 轨迹点标记 (黄色小球) ---
-        for i, pt in enumerate(path_points[::5]):  # 每5个点显示一个
-            pt_marker = Marker()
-            pt_marker.header.frame_id = "odom"
-            pt_marker.header.stamp = rospy.Time.now()
-            pt_marker.ns = "mppi_points"
-            pt_marker.id = i + 100
-            pt_marker.type = Marker.SPHERE
-            pt_marker.action = Marker.ADD
-            pt_marker.pose.position = pt
-            pt_marker.pose.orientation.w = 1.0
-            pt_marker.scale.x = 0.06
-            pt_marker.scale.y = 0.06
-            pt_marker.scale.z = 0.06
-            pt_marker.color.a = 0.8
-            pt_marker.color.r = 1.0
-            pt_marker.color.g = 1.0
-            pt_marker.color.b = 0.0
-            ma.markers.append(pt_marker)
-        
-        self.pub_markers.publish(ma)
-    
-    def visualize_goal(self):
-        """ 可视化目标点 """
-        if self.goal_pos is None:
-            return
-            
-        marker = Marker()
-        marker.header.frame_id = "odom"
-        marker.header.stamp = rospy.Time.now()
-        marker.ns = "goal"
-        marker.id = 0
-        marker.type = Marker.CYLINDER
-        marker.action = Marker.ADD
-        marker.pose.position.x = self.goal_pos[0].item()
-        marker.pose.position.y = self.goal_pos[1].item()
-        marker.pose.position.z = 0.1
-        marker.pose.orientation.w = 1.0
-        marker.scale.x = 0.3
-        marker.scale.y = 0.3
-        marker.scale.z = 0.2
-        marker.color.a = 0.8
-        marker.color.r = 0.0
-        marker.color.g = 1.0
-        marker.color.b = 0.0
-        self.pub_goal_marker.publish(marker)
-    
-    def visualize_obstacles(self):
-        """ 可视化检测到的障碍物点 """
-        ma = MarkerArray()
-        
-        for i, (obs_x, obs_y) in enumerate(self.obstacle_points):
-            marker = Marker()
-            marker.header.frame_id = "odom"
-            marker.header.stamp = rospy.Time.now()
-            marker.ns = "obstacles"
-            marker.id = i
-            marker.type = Marker.SPHERE
-            marker.action = Marker.ADD
-            marker.pose.position.x = obs_x
-            marker.pose.position.y = obs_y
-            marker.pose.position.z = 0.1
-            marker.pose.orientation.w = 1.0
-            marker.scale.x = 0.1
-            marker.scale.y = 0.1
-            marker.scale.z = 0.1
-            marker.color.a = 0.6
-            marker.color.r = 1.0
-            marker.color.g = 0.0
-            marker.color.b = 0.0
-            marker.lifetime = rospy.Duration(0.2)  # 短暂显示
-            ma.markers.append(marker)
-        
-        self.pub_obstacle_markers.publish(ma)
-    
-    def visualize_robot(self):
-        """ 可视化机器人当前位置和朝向 """
-        if self.current_state is None:
-            return
-            
-        marker = Marker()
-        marker.header.frame_id = "odom"
-        marker.header.stamp = rospy.Time.now()
-        marker.ns = "robot"
-        marker.id = 0
-        marker.type = Marker.ARROW
-        marker.action = Marker.ADD
-        
-        # 使用 pose 方式而不是 points 方式
-        theta = self.current_state[2].item()
-        marker.pose.position.x = self.current_state[0].item()
-        marker.pose.position.y = self.current_state[1].item()
-        marker.pose.position.z = 0.15
-        
-        # 设置方向 (yaw 角度转四元数)
-        marker.pose.orientation.x = 0.0
-        marker.pose.orientation.y = 0.0
-        marker.pose.orientation.z = np.sin(theta / 2.0)
-        marker.pose.orientation.w = np.cos(theta / 2.0)
-        
-        # 使用 pose 方式时，scale 表示箭头尺寸
-        marker.scale.x = 0.3   # 箭头长度
-        marker.scale.y = 0.08  # 箭头宽度
-        marker.scale.z = 0.08  # 箭头高度
-        
-        marker.color.a = 1.0
-        marker.color.r = 0.0
-        marker.color.g = 0.5
-        marker.color.b = 1.0
-        self.pub_robot_marker.publish(marker)
-
-if __name__ == '__main__':
-    try:
-        MPPIController()
-        rospy.spin()
-    except rospy.ROSInterruptException:
-        pass
+    def reset(self):
+        """ 重置 MPPI 内部状态 (比如 U 序列) """
+        self.mppi.reset()
