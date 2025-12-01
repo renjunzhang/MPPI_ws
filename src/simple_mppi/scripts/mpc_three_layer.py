@@ -19,6 +19,7 @@ from geometry_msgs.msg import Twist, PoseStamped
 from nav_msgs.msg import Odometry, Path, OccupancyGrid
 from sensor_msgs.msg import LaserScan
 from visualization_msgs.msg import Marker
+from std_msgs.msg import Float32MultiArray
 from tf.transformations import euler_from_quaternion, quaternion_from_euler
 
 # 导入三层模块
@@ -26,6 +27,12 @@ from global_planner import GlobalPathPlanner
 from local_planner import TrajectoryGenerator
 from mpc_tracker import MPCTracker
 from mppi_node import MPPITracker
+from ilqr_tracker import ILQRTracker
+
+# ========== 算法选择 (修改此处切换) ==========
+# 可选: 'MPC', 'MPPI', 'iLQR'
+TRACKER_TYPE = 'MPPI'
+# =============================================
 
 
 class ThreeLayerController:
@@ -46,12 +53,24 @@ class ThreeLayerController:
         self.current_state = None
         self.obstacle_points = []
         self.map_received = False
+
+        # 性能指标
+        self._metrics_poses = []
+        self._metrics_speeds = []
+        self._metrics_ctes = []
+
+        # ===== 时间与预测步长参数 =====
+        self.dt = 0.1          # 控制周期
+        self.N = 20            # iLQR 预测步数
+        self.replan_interval = 3.0
+        self.last_replan_time = 0.0
         
         # 三层模块
         self.global_planner = GlobalPathPlanner(resolution=0.05, inflate_radius=0.25)
         self.traj_generator = TrajectoryGenerator(v_max=0.18, v_min=0.08, w_max=1.2)
-        # self.mpc_tracker = MPCTracker(dt=0.1, N=20)
-        self.mpc_tracker = MPPITracker(dt=0.1, N=30)
+        self.tracker_type = TRACKER_TYPE
+        self.mpc_tracker = self._create_tracker(self.tracker_type)
+
         
         # 规划结果
         self.geometric_path = []
@@ -61,7 +80,7 @@ class ThreeLayerController:
         # 重规划参数
         self.replan_interval = 3.0
         self.last_replan_time = 0
-        self.dt = 0.1
+        # self.dt = 0.1
         
         # ROS 接口
         self._setup_ros()
@@ -74,8 +93,23 @@ class ThreeLayerController:
         rospy.loginfo("Three-Layer Hierarchical Controller")
         rospy.loginfo("  L1: Global Path Planning (A*)")
         rospy.loginfo("  L2: Trajectory Generation")
-        rospy.loginfo("  L3: Trajectory Tracking (MPC)")
+        rospy.loginfo(f"  L3: Trajectory Tracking ({TRACKER_TYPE})")
         rospy.loginfo("=" * 50)
+
+    def _create_tracker(self, tracker_type):
+        """根据类型创建跟踪器"""
+        if tracker_type == 'MPC':
+            rospy.loginfo("[Controller] Using MPC tracker")
+            return MPCTracker(dt=self.dt, N=self.N)
+        elif tracker_type == 'MPPI':
+            rospy.loginfo("[Controller] Using MPPI tracker")
+            return MPPITracker(dt=self.dt, N=30)
+        elif tracker_type == 'iLQR':
+            rospy.loginfo("[Controller] Using iLQR tracker")
+            return ILQRTracker(dt=self.dt, N=self.N, v_max=0.22, v_min=-0.05, w_max=2.0)
+        else:
+            rospy.logwarn(f"[Controller] Unknown tracker type: {tracker_type}, fallback to MPC")
+            return MPCTracker(dt=self.dt, N=self.N)
     
     def _setup_ros(self):
         """初始化 ROS 接口"""
@@ -86,6 +120,7 @@ class ThreeLayerController:
         self.pub_mpc_traj = rospy.Publisher('/mpc_predict_path', Path, queue_size=1)
         self.pub_goal_marker = rospy.Publisher('/goal_marker', Marker, queue_size=1)
         self.pub_ref_marker = rospy.Publisher('/current_ref_marker', Marker, queue_size=1)
+        self.pub_metrics = rospy.Publisher('/nav_metrics', Float32MultiArray, queue_size=1, latch=True)
         
         # Subscribers
         rospy.Subscriber('/custom_goal', PoseStamped, self._goal_cb)
@@ -113,6 +148,9 @@ class ThreeLayerController:
         self.traj_start_time = None
         self.last_replan_time = 0
         self.mpc_tracker.reset()
+        self._metrics_poses = []
+        self._metrics_speeds = []
+        self._metrics_ctes = []
         rospy.loginfo(f"[Controller] New goal: ({self.goal_pos[0]:.2f}, {self.goal_pos[1]:.2f})")
     
     def _scan_cb(self, msg):
@@ -155,6 +193,7 @@ class ThreeLayerController:
         # 检查是否到达目标
         dist = np.linalg.norm(self.goal_pos - self.current_state[:2])
         if dist < 0.15:
+            self._publish_metrics()
             rospy.loginfo("[Controller] Goal reached!")
             self.goal_pos = None
             self.reference_trajectory = None
@@ -184,19 +223,28 @@ class ThreeLayerController:
             self.last_replan_time = current_time
             return
         
-        # control, mpc_traj = self.mpc_tracker.solve(self.current_state, ref_window)
+        control, mpc_traj = self.mpc_tracker.solve(self.current_state, ref_window)
         # 修改后的调用 (传入 self.obstacle_points)：
-        control, mpc_traj = self.mpc_tracker.solve(
-            self.current_state, 
-            ref_window, 
-            self.obstacle_points  # <--- 关键！把雷达数据传进去
-        )
+        # control, mpc_traj = self.mpc_tracker.solve(
+        #     self.current_state, 
+        #     ref_window, 
+        #     self.obstacle_points  # <--- 关键！把雷达数据传进去
+        # )
         
         # 发布控制
         cmd = Twist()
         cmd.linear.x = float(control[0])
         cmd.angular.z = float(control[1])
         self.pub_cmd.publish(cmd)
+
+        # 记录性能指标
+        self._metrics_poses.append((self.current_state[0], self.current_state[1]))
+        self._metrics_speeds.append(float(control[0]))
+        if ref_window:
+            cte = np.sqrt((self.current_state[0]-ref_window[0]['x'])**2 + (self.current_state[1]-ref_window[0]['y'])**2)
+            # 过滤异常值（初始帧可能参考点异常）
+            if cte < 0.5:
+                self._metrics_ctes.append(cte)
         
         # 可视化
         self._visualize(ref_window, mpc_traj)
@@ -314,6 +362,25 @@ class ThreeLayerController:
         m.color.a = 1.0
         m.color.r = m.color.g = 1.0
         self.pub_ref_marker.publish(m)
+
+    def _publish_metrics(self):
+        """导航结束时计算并发布性能指标"""
+        if len(self._metrics_poses) < 2:
+            return
+        # 路径长度
+        length = sum(np.sqrt((self._metrics_poses[i+1][0]-self._metrics_poses[i][0])**2 +
+                             (self._metrics_poses[i+1][1]-self._metrics_poses[i][1])**2)
+                     for i in range(len(self._metrics_poses)-1))
+        # 平均速度
+        avg_speed = np.mean(self._metrics_speeds) if self._metrics_speeds else 0.0
+        # 平均/最大横向误差
+        avg_cte = np.mean(self._metrics_ctes) if self._metrics_ctes else 0.0
+        max_cte = np.max(self._metrics_ctes) if self._metrics_ctes else 0.0
+        # 发布 [path_length, avg_speed, avg_cte, max_cte]
+        msg = Float32MultiArray()
+        msg.data = [float(length), float(avg_speed), float(avg_cte), float(max_cte)]
+        self.pub_metrics.publish(msg)
+        rospy.loginfo(f"[Metrics] 路径长度:{length:.2f}m, 平均速度:{avg_speed:.2f}m/s, 平均CTE:{avg_cte:.3f}m, 最大CTE:{max_cte:.3f}m")
 
 
 if __name__ == '__main__':

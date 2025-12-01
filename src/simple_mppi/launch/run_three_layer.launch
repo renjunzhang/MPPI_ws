@@ -21,10 +21,10 @@
 
     <!-- 三层架构控制器 -->
     <node name="three_layer_controller" pkg="simple_mppi" type="mpc_three_layer.py" output="screen">
-        <param name="use_apf" value="true"/>
+        <!-- <param name="use_apf" value="true"/>
         <param name="apf_k_att" value="160.0"/>
         <param name="apf_eta" value="1.0"/>
-        <param name="apf_d0" value="0.6"/>
+        <param name="apf_d0" value="0.6"/> -->
     </node>
 
     <!-- RViz -->

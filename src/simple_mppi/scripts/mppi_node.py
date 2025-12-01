@@ -79,7 +79,7 @@ class MPPITracker:
                          u_min=torch.tensor([-0.05, -self.w_max], device=self.device, dtype=torch.float32),
                          u_max=torch.tensor([self.v_max, self.w_max], device=self.device, dtype=torch.float32))
         
-        rospy.loginfo("[MPPITracker] Initialized")
+        rospy.loginfo(f"[MPPITracker] Initialized: N={N}, dt={dt}")
 
     def _dynamics(self, state, action):
         """
