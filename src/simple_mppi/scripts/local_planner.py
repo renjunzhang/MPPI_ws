@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """
-局部轨迹规划模块 (Layer 2)
-==========================
+局部轨迹规划模块 (Layer 2) - 改进版
+====================================
 将几何路径转换为时间参数化轨迹
 
+算法改进:
+    1. 三次样条插值 (替代线性插值) - 更平滑的路径
+    2. 基于优化的速度规划 - 考虑加速度约束
+    3. 梯形速度曲线 - 平滑的加减速
+
 功能:
-    - 路径插值 (密集采样)
+    - 路径平滑 (三次样条)
     - 曲率计算
     - 基于曲率的速度规划 (弯道减速)
-    - 加减速处理
+    - 梯形加减速处理
     - 时间参数化轨迹生成
 
 输入: 几何路径 [(x, y), ...], 当前状态 [x, y, theta]
@@ -17,7 +22,8 @@
 作者: GitHub Copilot
 """
 
-import numpy as np
+import numpy as np  # 引入 NumPy 用于数值计算
+from scipy import interpolate   # 引入 SciPy 的插值模块，用于三次样条插值
 
 # ROS 依赖 (可选)
 try:
@@ -34,7 +40,7 @@ def _log_info(msg):
         print(f"[INFO] {msg}")
 
 
-class TrajectoryGenerator:
+class TrajectoryGenerator:  # 这个class是局部轨迹规划器的核心，就代表着局部规划器
     """
     轨迹生成器
     
@@ -52,7 +58,7 @@ class TrajectoryGenerator:
         w_max (float): 最大角速度 (rad/s)
     """
     
-    def __init__(self, v_max=0.20, v_min=0.05, w_max=1.5):
+    def __init__(self, v_max=0.20, v_min=0.05, w_max=1.5, a_max=0.5, alpha_max=1.0):
         """
         初始化轨迹生成器
         
@@ -60,12 +66,20 @@ class TrajectoryGenerator:
             v_max: 最大线速度 (m/s)
             v_min: 最小线速度 (m/s)
             w_max: 最大角速度 (rad/s)
+            a_max: 最大线加速度 (m/s^2) - 新增
+            alpha_max: 最大角加速度 (rad/s^2) - 新增
         """
         self.v_max = v_max
         self.v_min = v_min
         self.w_max = w_max
+        self.a_max = a_max
+        self.alpha_max = alpha_max
         
-        _log_info("[TrajectoryGenerator] Initialized")
+        # 解析计算结果缓存 (来自B样条求导)
+        self._spline_headings = None    # 解析航向角
+        self._spline_curvatures = None  # 解析曲率
+        
+        _log_info(f"[TrajectoryGenerator] Initialized (v_max={v_max}, a_max={a_max})")
     
     def generate(self, geometric_path, current_state, dt=0.1):
         """
@@ -82,17 +96,25 @@ class TrajectoryGenerator:
         if geometric_path is None or len(geometric_path) < 2:
             return None
         
-        # Step 1: 路径插值
-        dense_path = self._interpolate_path(geometric_path, spacing=0.05)
+        # 初始化解析结果
+        self._spline_headings = None
+        self._spline_curvatures = None
         
-        # Step 2: 计算曲率
-        curvatures = self._compute_curvatures(dense_path)
+        # Step 1: 路径平滑 (B样条 + 解析求导)
+        dense_path = self._smooth_path_spline(geometric_path, spacing=0.05)
         
-        # Step 3: 速度规划
-        speeds = self._plan_speeds(dense_path, curvatures)
+        # Step 2: 获取曲率 (优先使用解析结果，否则数值计算)
+        if self._spline_curvatures is not None and len(self._spline_curvatures) == len(dense_path):
+            curvatures = list(self._spline_curvatures)
+            _log_info("[TrajectoryGenerator] Using analytical curvature from spline")
+        else:
+            curvatures = self._compute_curvatures(dense_path)
         
-        # Step 4: 生成轨迹
-        trajectory = self._build_trajectory(dense_path, speeds, current_state, dt)
+        # Step 3: 速度规划 (考虑曲率和加速度约束)
+        speeds = self._plan_speeds_optimized(dense_path, curvatures)
+        
+        # Step 4: 生成轨迹 (使用解析航向或数值计算)
+        trajectory = self._build_trajectory_improved(dense_path, speeds, current_state, dt)
         
         # Step 5: 添加停止段
         trajectory = self._add_stop_segment(trajectory, dt)
@@ -102,7 +124,91 @@ class TrajectoryGenerator:
         
         return trajectory
     
-    def _interpolate_path(self, path, spacing=0.05):
+    def _smooth_path_spline(self, path, spacing=0.05, use_bspline=True):
+        """
+        样条平滑路径 (改进版 - 参考 PythonRobotics)
+        
+        使用 UnivariateSpline 进行B样条平滑，支持解析求导计算航向和曲率。
+        
+        Args:
+            path: 原始路径 [(x, y), ...]
+            spacing: 点间距 (m)
+            use_bspline: True=B样条逼近(更平滑), False=精确插值
+        
+        Returns:
+            dense_path: 密集路径点列表
+            
+        同时更新:
+            self._spline_headings: 解析计算的航向角
+            self._spline_curvatures: 解析计算的曲率
+        """
+        if len(path) < 4:
+            # 点太少，退化为线性插值
+            self._spline_headings = None
+            self._spline_curvatures = None
+            return self._interpolate_path(path, spacing)
+        
+        # 提取 x, y
+        x = np.array([p[0] for p in path])
+        y = np.array([p[1] for p in path])
+        
+        # 计算归一化弧长参数 (参考 PythonRobotics)
+        dx, dy = np.diff(x), np.diff(y) # 计算差分，得到每段的增量的数组
+        distances = np.cumsum([np.hypot(idx, idy) for idx, idy in zip(dx, dy)]) # distances[i] 表示从第 1 个点走到第 i+1 个点所经过的总路程
+        distances = np.concatenate([[0.0], distances])  # 对齐坐标数组 x, y 的长度
+        total_length = distances[-1]
+        
+        if total_length < 0.1:
+            self._spline_headings = None
+            self._spline_curvatures = None
+            return list(path)
+        
+        # 归一化到 [0, 1]
+        distances_norm = distances / total_length
+        
+        try:
+            # 平滑参数: use_bspline=True 时平滑, False 时精确插值
+            smoothing = len(path) * 0.01 if use_bspline else 0.0
+            degree = min(3, len(path) - 1)
+            
+            # 使用 UnivariateSpline (与 PythonRobotics 相同)
+            spl_x = interpolate.UnivariateSpline(distances_norm, x, k=degree, s=smoothing)
+            spl_y = interpolate.UnivariateSpline(distances_norm, y, k=degree, s=smoothing)
+            
+            # 均匀采样
+            n_points = max(int(total_length / spacing), 2)
+            sampled = np.linspace(0.0, 1.0, n_points)
+            
+            # 计算位置
+            x_new = spl_x(sampled)
+            y_new = spl_y(sampled)
+            
+            # 解析求导计算航向角 (比差分更准确)
+            dx_ds = spl_x.derivative(1)(sampled)
+            dy_ds = spl_y.derivative(1)(sampled)
+            headings = np.arctan2(dy_ds, dx_ds)
+            
+            # 解析求导计算曲率 (比三点法更准确)
+            ddx_ds = spl_x.derivative(2)(sampled)
+            ddy_ds = spl_y.derivative(2)(sampled)
+            # 曲率公式: κ = (x'y'' - y'x'') / (x'^2 + y'^2)^(3/2)
+            curvatures = (dy_ds * ddx_ds - dx_ds * ddy_ds) / \
+                         np.power(dx_ds**2 + dy_ds**2 + 1e-9, 1.5)
+            
+            # 保存解析结果供后续使用
+            self._spline_headings = headings
+            self._spline_curvatures = np.abs(curvatures)  # 取绝对值
+            
+            return [(x_new[i], y_new[i]) for i in range(len(x_new))]
+            
+        except Exception as e:
+            # 样条插值失败，退化为线性插值
+            _log_info(f"[TrajectoryGenerator] Spline failed！！！: {e}, using linear")
+            self._spline_headings = None
+            self._spline_curvatures = None
+            return self._interpolate_path(path, spacing)
+    
+    def _interpolate_path(self, path, spacing=0.05):        # spacing点间距是插入的点的间距
         """
         路径插值，生成密集点
         
@@ -156,60 +262,84 @@ class TrajectoryGenerator:
         
         return smoothed
     
-    def _plan_speeds(self, path, curvatures):
+    def _plan_speeds_optimized(self, path, curvatures):
         """
-        基于曲率的速度规划
+        优化的速度规划 (改进版)
         
-        - 直道高速
-        - 弯道减速
-        - 起点加速
-        - 终点减速
+        改进点:
+            1. 曲率-速度约束: v <= v_max / sqrt(1 + k*|curvature|)
+            2. 前向-后向传播: 满足加速度约束
+            3. 梯形速度曲线: 平滑的加减速
+        
+        Args:
+            path: 路径点
+            curvatures: 曲率
+        Returns:
+            speeds: 速度列表
         """
         n = len(path)
-        speeds = [self.v_max] * n
+        if n < 2:
+            return [0.0] * n
         
-        # 1. 曲率自适应 (弯道减速)
-        curvature_sensitivity = 2.0
+        # Step 1: 基于曲率的速度上限
+        v_curvature = np.zeros(n)
+        curvature_gain = 3.0  # 曲率敏感度
         for i in range(n):
-            speeds[i] = self.v_max / (1 + curvature_sensitivity * curvatures[i])
-            speeds[i] = np.clip(speeds[i], self.v_min, self.v_max)
+            # v_max / sqrt(1 + k*|curvature|) 比原来的除法更平滑
+            v_curvature[i] = self.v_max / np.sqrt(1 + curvature_gain * abs(curvatures[i]))
+            v_curvature[i] = np.clip(v_curvature[i], self.v_min, self.v_max)
         
-        # 2. 终点减速
-        decel_dist = 0.3
-        total_dist = 0
-        for i in range(n - 1, 0, -1):
-            dist = np.sqrt((path[i][0]-path[i-1][0])**2 + (path[i][1]-path[i-1][1])**2)
-            total_dist += dist
-            if total_dist < decel_dist:
-                speeds[i] = min(speeds[i], self.v_max * total_dist / decel_dist)
-                speeds[i] = max(0.0, speeds[i])
+        # Step 2: 终点速度为 0
+        v_curvature[-1] = 0.0
+        v_curvature[-2] = 0.0 if n > 1 else 0.0
         
-        # 最后几个点速度为0
-        for i in range(max(0, n-3), n):
-            speeds[i] = 0.0
+        # Step 3: 后向传播 - 确保能减速停下来
+        # v[i]^2 <= v[i+1]^2 + 2 * a_max * ds
+        speeds = v_curvature.copy()
+        for i in range(n - 2, -1, -1):
+            ds = np.sqrt((path[i+1][0] - path[i][0])**2 + 
+                         (path[i+1][1] - path[i][1])**2)
+            v_decel = np.sqrt(speeds[i+1]**2 + 2 * self.a_max * ds)
+            speeds[i] = min(speeds[i], v_decel)
         
-        # 3. 起点加速
-        accel_dist = 0.2
-        total_dist = 0
+        # Step 4: 前向传播 - 确保能加速到目标速度
+        # v[i+1]^2 <= v[i]^2 + 2 * a_max * ds
         for i in range(n - 1):
-            dist = np.sqrt((path[i+1][0]-path[i][0])**2 + (path[i+1][1]-path[i][1])**2)
-            total_dist += dist
-            if total_dist < accel_dist:
-                speeds[i] = min(speeds[i], self.v_max * total_dist / accel_dist + self.v_min)
+            ds = np.sqrt((path[i+1][0] - path[i][0])**2 + 
+                         (path[i+1][1] - path[i][1])**2)
+            v_accel = np.sqrt(speeds[i]**2 + 2 * self.a_max * ds)
+            speeds[i+1] = min(speeds[i+1], v_accel)
         
-        return speeds
+        # Step 5: 起点速度处理 (从静止开始)
+        speeds[0] = min(speeds[0], self.v_min)
+        
+        return list(speeds)
     
-    def _build_trajectory(self, path, speeds, current_state, dt):
-        """构建轨迹"""
+    def _build_trajectory_improved(self, path, speeds, current_state, dt):
+        """
+        构建轨迹 (改进版 - 使用解析航向)
+        
+        如果有解析计算的航向角，使用它们代替差分近似。
+        解析航向更准确、更平滑。
+        """
         trajectory = []
-        t = 0.0
+        t = 0.0     # 全局时间累加器
+        
+        # 检查是否有解析航向
+        use_analytical = (self._spline_headings is not None and 
+                          len(self._spline_headings) == len(path))
+        
+        if use_analytical:
+            _log_info("[TrajectoryGenerator] Using analytical heading from spline")
         
         for i in range(len(path)):
             x, y = path[i]
             v = speeds[i]
             
-            # 计算朝向
-            if i < len(path) - 1:
+            # 计算朝向 (优先使用解析结果)
+            if use_analytical:
+                theta = self._spline_headings[i]
+            elif i < len(path) - 1:
                 dx = path[i+1][0] - x
                 dy = path[i+1][1] - y
                 theta = np.arctan2(dy, dx)
@@ -219,7 +349,15 @@ class TrajectoryGenerator:
             # 计算角速度
             if i > 0:
                 dtheta = self._normalize_angle(theta - trajectory[-1]['theta'])
-                omega = np.clip(dtheta / dt, -self.w_max, self.w_max) if dt > 0 else 0.0
+                # 使用实际时间间隔计算角速度
+                if trajectory:
+                    dt_actual = t - trajectory[-1]['t']
+                    if dt_actual > 0.001:
+                        omega = np.clip(dtheta / dt_actual, -self.w_max, self.w_max)
+                    else:
+                        omega = np.clip(dtheta / dt, -self.w_max, self.w_max)
+                else:
+                    omega = 0.0
             else:
                 omega = 0.0
             
@@ -228,7 +366,7 @@ class TrajectoryGenerator:
                 'v': v, 'omega': omega, 't': t
             })
             
-            # 时间步进
+            # 时间步进 (基于实际距离和速度)
             if i < len(path) - 1 and v > 0.01:
                 dist = np.sqrt((path[i+1][0] - x)**2 + (path[i+1][1] - y)**2)
                 t += dist / max(v, 0.01)

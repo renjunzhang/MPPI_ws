@@ -1,0 +1,32 @@
+<launch>
+    <param name="/use_sim_time" value="true" />
+
+    <arg name="model" default="burger" doc="model type [burger, waffle, waffle_pi]"/>
+    
+    <!-- Gazebo TurtleBot3 World -->
+    <include file="$(find turtlebot3_gazebo)/launch/turtlebot3_world.launch"/>
+
+    <!-- TurtleBot3 Bringup -->
+    <include file="$(find turtlebot3_bringup)/launch/turtlebot3_remote.launch"/>
+
+    <!-- TF: map -> odom -->
+    <node pkg="tf" type="static_transform_publisher" name="map_odom_broadcaster" 
+          args="0 0 0 0 0 0 map odom 100" />
+
+    <!-- 静态地图服务器 -->
+    <node name="map_server" pkg="map_server" type="map_server" 
+          args="$(find turtlebot3_navigation)/maps/map.yaml">
+        <param name="frame_id" value="map"/>
+    </node>
+
+    <!-- 二层架构控制器 (A* + iLQR) -->
+    <node name="ilqr_two_layer_controller" pkg="simple_mppi" type="ilqr_two_layer.py" output="screen">
+        <!-- iLQR 障碍物避障参数 (大幅提高避障强度) -->
+        <param name="obs_eta" value="100.0"/>  <!-- 斥力强度 -->
+        <param name="obs_d0" value="0.6"/>     <!-- 影响范围 (m) -->
+    </node>
+
+    <!-- RViz (使用 iLQR 专用配置) -->
+    <node name="rviz" pkg="rviz" type="rviz"
+          args="-d $(find simple_mppi)/rviz/ilqr_two_layer.rviz"/>
+</launch>
