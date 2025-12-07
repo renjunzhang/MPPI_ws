@@ -34,6 +34,8 @@ class MPPITracker:
         - 模块化 Critics 代价函数
         - 支持 Costmap 查表
         - 软约束设计
+        - 控制平滑性惩罚 (防止抖动)
+        - 死区设计 (避免过度微调)
     """
 
     def __init__(self, dt=0.1, N=30):
@@ -68,6 +70,13 @@ class MPPITracker:
         # === 障碍物点列表 (备用) ===
         self.obstacle_points = None
 
+        # === 上一帧控制量 (用于平滑性惩罚) ===
+        self.last_action = torch.zeros(2, device=self.device, dtype=torch.float32)
+
+        # === 死区参数 ===
+        self.position_deadband = rospy.get_param("~position_deadband", 0.05)  # 5cm
+        self.angle_deadband = rospy.get_param("~angle_deadband", 0.087)  # 5度 ≈ 0.087 rad
+
         # === Critics 权重 (可调参数) ===
         self.weights = {
             'path_follow': rospy.get_param("~w_path_follow", 50.0),   # 路径跟随
@@ -77,6 +86,7 @@ class MPPITracker:
             'angular': rospy.get_param("~w_angular", 1.0),            # 角速度惩罚
             'obstacle': rospy.get_param("~w_obstacle", 100.0),        # 障碍物
             'constraint': rospy.get_param("~w_constraint", 500.0),    # 约束违反
+            'smoothness': rospy.get_param("~w_smoothness", 30.0),     # 控制平滑性 (新增)
         }
 
         # === APF 参数 (障碍物斥力) ===
@@ -84,6 +94,7 @@ class MPPITracker:
         self.obs_eta = rospy.get_param("~obs_eta", 1.0)  # 斥力强度
 
         rospy.loginfo(f"[MPPITracker] Critics weights: {self.weights}")
+        rospy.loginfo(f"[MPPITracker] Deadband: pos={self.position_deadband}m, ang={np.degrees(self.angle_deadband):.1f}deg")
 
         # === MPPI 噪声设置 ===
         noise_sigma = torch.tensor([
@@ -137,14 +148,33 @@ class MPPITracker:
         总代价函数 = 各 Critics 加权和
 
         参考 Nav2 MPPI 的模块化设计
+        
+        改进:
+            1. 添加控制平滑性惩罚 (防止抖动)
+            2. 死区设计 (避免过度微调)
         """
         cost = torch.zeros(state.shape[0], device=self.device)
 
-        # 1. PathFollowCritic: 横向偏差 (Cross Track Error)
-        cost += self.weights['path_follow'] * self._path_follow_critic(state)
+        # 1. PathFollowCritic: 横向偏差 (Cross Track Error) - 带死区
+        path_cost = self._path_follow_critic(state)
+        # 死区: 如果误差 < position_deadband，代价减小到接近 0
+        path_cost = torch.where(
+            path_cost < self.position_deadband ** 2,
+            path_cost * 0.1,  # 在死区内只保留 10% 的代价
+            path_cost
+        )
+        cost += self.weights['path_follow'] * path_cost
 
-        # 2. PathAlignCritic: 朝向对齐
-        cost += self.weights['path_align'] * self._path_align_critic(state)
+        # 2. PathAlignCritic: 朝向对齐 - 带死区
+        align_cost = self._path_align_critic(state)
+        # 死区: 小角度误差不惩罚 (1 - cos(5deg) ≈ 0.004)
+        align_deadband = 1.0 - np.cos(self.angle_deadband)
+        align_cost = torch.where(
+            align_cost < align_deadband * 2.0,
+            align_cost * 0.1,
+            align_cost
+        )
+        cost += self.weights['path_align'] * align_cost
 
         # 3. GoalDistCritic: 目标距离
         cost += self.weights['goal_dist'] * self._goal_dist_critic(state)
@@ -160,6 +190,9 @@ class MPPITracker:
 
         # 7. ConstraintCritic: 软约束违反惩罚
         cost += self.weights['constraint'] * self._constraint_critic(action)
+
+        # 8. SmoothnessCritic: 控制平滑性惩罚 (新增)
+        cost += self.weights['smoothness'] * self._smoothness_critic(action)
 
         return cost
 
@@ -332,6 +365,23 @@ class MPPITracker:
 
         return cost
 
+    def _smoothness_critic(self, action):
+        """
+        SmoothnessCritic: 控制平滑性惩罚 (新增)
+
+        惩罚控制量相对于上一帧的变化，防止抖动
+        """
+        # 角速度变化惩罚 (主要防止方向抖动)
+        w = action[:, 1]
+        w_change = (w - self.last_action[1]) ** 2
+        
+        # 线速度变化惩罚 (防止加减速抖动)
+        v = action[:, 0]
+        v_change = (v - self.last_action[0]) ** 2
+        
+        # 角速度变化权重更高，因为方向抖动更明显
+        return w_change * 2.0 + v_change * 0.5
+
     # ==================== 主求解函数 ====================
 
     def solve(self, current_state, reference_window, obstacles_list=None, costmap_data=None):
@@ -380,7 +430,11 @@ class MPPITracker:
         v = float(torch.clamp(action[0], self.v_min, self.v_max).item())
         w = float(torch.clamp(action[1], -self.w_max, self.w_max).item())
 
-        # 6. 生成预测轨迹
+        # 6. 更新上一帧控制量 (用于平滑性惩罚)
+        self.last_action[0] = v
+        self.last_action[1] = w
+
+        # 7. 生成预测轨迹
         pred_traj = self._predict_trajectory(curr_state_tensor)
 
         return np.array([v, w]), pred_traj
@@ -412,6 +466,7 @@ class MPPITracker:
     def reset(self):
         """重置 MPPI 内部状态"""
         self.mppi.reset()
+        self.last_action = torch.zeros(2, device=self.device, dtype=torch.float32)
 
     def set_costmap(self, grid, resolution, origin):
         """

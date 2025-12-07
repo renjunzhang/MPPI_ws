@@ -1,0 +1,5 @@
+<launch>
+  <param name="use_gui" value="true"/>
+  <arg name="config" default="robot" />
+  <node name="rviz" pkg="rviz" type="rviz" args="-d $(find simple_mppi)/rviz/ridgeback.rviz" />
+</launch>

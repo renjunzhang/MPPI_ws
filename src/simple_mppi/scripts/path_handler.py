@@ -211,17 +211,22 @@ class PathHandler:
 
     def get_reference_window(self, robot_pose, horizon, dt, v_ref=0.15):
         """
-        获取参考轨迹窗口 (MPPI 使用)
+        获取参考轨迹窗口 (MPPI 使用) - 空间驱动版本
 
-        关键改进:
-            1. 修正1: 信任 B-Spline 计算的精准 theta (不重新差分计算)
-            2. 修正3: 使用 lookahead_dist 动态计算起始点
-            3. 基于时间步长采样
+        关键改进 (解决 "Phantom Rabbit" 问题):
+            1. 完全基于空间位置，不基于时间
+            2. 从机器人最近点开始，向前截取 N 个点
+            3. 参考轨迹永远在机器人前方"等着它"
+            
+        这样:
+            - 机器人慢了: 参考窗口停下来等
+            - 机器人快了: 参考窗口跟着前进
+            - 结果: 丝滑跟踪，不会"追赶时间"
 
         Args:
             robot_pose: (x, y, theta)
             horizon: 预测步数 N
-            dt: 时间步长
+            dt: 时间步长 (用于计算采样间隔)
             v_ref: 参考速度 (备用)
 
         Returns:
@@ -232,10 +237,12 @@ class PathHandler:
 
         rx, ry, rtheta = robot_pose
 
-        # 找到最近点 (也限制搜索范围)
+        # === Step 1: 找到当前位置在参考轨迹上的最近点 (Nearest Neighbor) ===
+        # 只搜索前 50 个点，避免在 U 型/8 字型路径上误判
         search_horizon = min(len(self.active_path), 50)
         min_dist = float('inf')
         closest_idx = 0
+        
         for i in range(search_horizon):
             pt = self.active_path[i]
             dist = np.sqrt((pt['x'] - rx)**2 + (pt['y'] - ry)**2)
@@ -243,8 +250,8 @@ class PathHandler:
                 min_dist = dist
                 closest_idx = i
 
-        # === 修正3: 使用 lookahead_dist 动态计算起始点 ===
-        # 从最近点向前搜索，直到累积距离 >= lookahead_dist
+        # === Step 2: 从最近点开始，向前看 lookahead_dist 作为起始点 ===
+        # 这样参考点总是在机器人前方一小段距离
         start_idx = closest_idx
         accumulated_dist = 0.0
 
@@ -257,7 +264,8 @@ class PathHandler:
             if accumulated_dist >= self.lookahead_dist:
                 break
 
-        # === 基于时间步长采样 ===
+        # === Step 3: 从 start_idx 开始，向后截取 horizon 个点 ===
+        # 使用速度 * dt 计算每步应该前进的距离
         window = []
         curr_idx = start_idx
 
@@ -267,8 +275,7 @@ class PathHandler:
 
             pt = self.active_path[curr_idx]
 
-            # === 修正1: 信任 B-Spline 计算的精准 theta ===
-            # 只有第一步且离机器人较远时，才用差分计算引导方向
+            # 第一步: 计算从机器人指向参考点的引导方向
             if k == 0:
                 dx = pt['x'] - rx
                 dy = pt['y'] - ry
@@ -278,7 +285,7 @@ class PathHandler:
                 else:
                     ref_theta = pt['theta']  # 离得近就信任路径角度
             else:
-                # 后续点绝对信任 B-Spline 计算的精准角度
+                # 后续点信任 B-Spline 计算的精准角度
                 ref_theta = pt['theta']
 
             # 使用平滑轨迹中的速度，或备用速度
@@ -292,10 +299,11 @@ class PathHandler:
                 'v': v
             })
 
-            # 前进一个时间步的距离
+            # 前进一个时间步的距离 (基于当前点的速度)
             dist_step = v * dt
             dist_accumulated = 0.0
 
+            # 沿路径前进 dist_step 距离
             while curr_idx < len(self.active_path) - 1:
                 p1 = self.active_path[curr_idx]
                 p2 = self.active_path[curr_idx + 1]
