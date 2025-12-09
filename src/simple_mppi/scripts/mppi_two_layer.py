@@ -18,17 +18,18 @@
 
 import rospy
 import numpy as np
+import time
 from geometry_msgs.msg import Twist, PoseStamped
 from nav_msgs.msg import Odometry, Path, OccupancyGrid
 from sensor_msgs.msg import LaserScan
 from visualization_msgs.msg import Marker
-from std_msgs.msg import Float32MultiArray
 from tf.transformations import euler_from_quaternion
 
 # 导入模块
 from global_planner import GlobalPathPlanner
 from path_handler import PathHandler
 from mppi_node import MPPITracker
+from metrics_collector import MetricsCollector
 
 
 class MPPITwoLayerController:
@@ -52,15 +53,13 @@ class MPPITwoLayerController:
         self.obstacle_points = []
         self.map_received = False
 
-        # 性能指标
-        self._metrics_poses = []
-        self._metrics_speeds = []
-        self._metrics_ctes = []
+        # 性能指标收集器
+        self.metrics = MetricsCollector(algo_name="MPPI")
 
         # ===== 参数 =====
         self.dt = 0.1
-        self.N = 30  # MPPI 预测步数
-        self.replan_interval = 3.0
+        self.N = 20  # MPPI 预测步数 (降低以加快计算)
+        self.replan_interval = 5.0  # 增加重规划间隔，减少跳变
         self.last_replan_time = 0.0
         self.v_ref = rospy.get_param("~v_ref", 0.15)  # 参考速度
 
@@ -69,8 +68,8 @@ class MPPITwoLayerController:
 
         # ===== PathHandler: 路径处理 (Nav2 风格 + B-Spline 平滑) =====
         self.path_handler = PathHandler(
-            lookahead_dist=rospy.get_param("~lookahead_dist", 0.3),
-            prune_distance=rospy.get_param("~prune_distance", 0.2),
+            lookahead_dist=rospy.get_param("~lookahead_dist", 0.5),  # 增大前瞻距离
+            prune_distance=rospy.get_param("~prune_distance", 0.15),  # 减小剪裁距离
             v_max=0.20,
             v_min=0.05,
             w_max=1.5,
@@ -105,7 +104,6 @@ class MPPITwoLayerController:
         self.pub_active_path = rospy.Publisher('/active_path', Path, queue_size=1)
         self.pub_mppi_traj = rospy.Publisher('/mppi_predict_path', Path, queue_size=1)
         self.pub_goal_marker = rospy.Publisher('/goal_marker', Marker, queue_size=1)
-        self.pub_metrics = rospy.Publisher('/nav_metrics', Float32MultiArray, queue_size=1, latch=True)
 
         # Subscribers
         rospy.Subscriber('/custom_goal', PoseStamped, self._goal_cb)
@@ -133,10 +131,8 @@ class MPPITwoLayerController:
         self.last_replan_time = 0
         self.mppi_tracker.reset()
 
-        # 重置性能指标
-        self._metrics_poses = []
-        self._metrics_speeds = []
-        self._metrics_ctes = []
+        # 设置目标并开始记录
+        self.metrics.set_goal(self.current_state[:2], self.goal_pos)
 
         rospy.loginfo(f"[MPPIController] New goal: ({self.goal_pos[0]:.2f}, {self.goal_pos[1]:.2f})")
 
@@ -188,8 +184,8 @@ class MPPITwoLayerController:
 
         # 检查是否到达目标
         dist = np.linalg.norm(self.goal_pos - self.current_state[:2])
-        if dist < 0.15:
-            self._publish_metrics()
+        if dist < 0.20:  # 放宽到达判定距离
+            self.metrics.finish(success=True)
             rospy.loginfo("[MPPIController] Goal reached!")
             self.goal_pos = None
             self.geometric_path = []
@@ -226,11 +222,13 @@ class MPPITwoLayerController:
             return
 
         # MPPI 求解 (使用 Costmap，不用障碍物点列表)
+        t_start = time.time()
         control, mppi_traj = self.mppi_tracker.solve(
             self.current_state,
             ref_window,
             obstacles_list=self.obstacle_points  # 仍传入作为备用
         )
+        solve_time = time.time() - t_start
 
         # 发布控制
         cmd = Twist()
@@ -239,7 +237,7 @@ class MPPITwoLayerController:
         self.pub_cmd.publish(cmd)
 
         # 记录性能指标
-        self._record_metrics(control)
+        self._record_metrics(control, ref_window, solve_time)
 
         # 可视化
         self._visualize(mppi_traj)
@@ -269,21 +267,18 @@ class MPPITwoLayerController:
         rospy.loginfo(f"[MPPIController] Plan: {len(path)} waypoints -> "
                       f"{len(self.path_handler.active_path)} smooth trajectory points")
 
-    def _record_metrics(self, control):
+    def _record_metrics(self, control, ref_window, solve_time=None):
         """记录性能指标"""
-        self._metrics_poses.append((self.current_state[0], self.current_state[1]))
-        self._metrics_speeds.append(float(control[0]))
-
-        # CTE: 到活跃路径最近点的距离
-        active_path = self.path_handler.get_full_active_path()
-        if active_path:
-            min_dist = min(
-                np.sqrt((self.current_state[0]-p['x'])**2 +
-                        (self.current_state[1]-p['y'])**2)
-                for p in active_path
-            )
-            if min_dist < 0.5:
-                self._metrics_ctes.append(min_dist)
+        # 获取参考点 (第一个点)
+        ref_point = ref_window[0] if ref_window else None
+        
+        # 使用 MetricsCollector 记录
+        self.metrics.record(
+            pose=self.current_state,
+            control=control,
+            ref_point=ref_point,
+            solve_time=solve_time
+        )
 
     # ==================== 可视化 ====================
 
@@ -345,31 +340,6 @@ class MPPITwoLayerController:
         m.color.r = 1.0
         m.color.g = 0.5
         self.pub_goal_marker.publish(m)
-
-    def _publish_metrics(self):
-        """导航结束时计算并发布性能指标"""
-        if len(self._metrics_poses) < 2:
-            return
-
-        # 路径长度
-        length = sum(
-            np.sqrt((self._metrics_poses[i+1][0]-self._metrics_poses[i][0])**2 +
-                    (self._metrics_poses[i+1][1]-self._metrics_poses[i][1])**2)
-            for i in range(len(self._metrics_poses)-1)
-        )
-        # 平均速度
-        avg_speed = np.mean(self._metrics_speeds) if self._metrics_speeds else 0.0
-        # 平均/最大横向误差
-        avg_cte = np.mean(self._metrics_ctes) if self._metrics_ctes else 0.0
-        max_cte = np.max(self._metrics_ctes) if self._metrics_ctes else 0.0
-
-        # 发布
-        msg = Float32MultiArray()
-        msg.data = [float(length), float(avg_speed), float(avg_cte), float(max_cte)]
-        self.pub_metrics.publish(msg)
-
-        rospy.loginfo(f"[Metrics] 路径长度:{length:.2f}m, 平均速度:{avg_speed:.2f}m/s, "
-                      f"平均CTE:{avg_cte:.3f}m, 最大CTE:{max_cte:.3f}m")
 
 
 if __name__ == '__main__':

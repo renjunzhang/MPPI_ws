@@ -16,6 +16,7 @@
 
 import rospy
 import numpy as np
+import time
 from geometry_msgs.msg import Twist, PoseStamped
 from nav_msgs.msg import Odometry, Path, OccupancyGrid
 from sensor_msgs.msg import LaserScan
@@ -25,6 +26,7 @@ from tf.transformations import euler_from_quaternion
 from global_planner import GlobalPathPlanner
 from local_planner import TrajectoryGenerator
 from ilqr_tracker import ILQRTracker
+from metrics_collector import MetricsCollector
 
 
 class ILQRTwoLayerController:
@@ -49,6 +51,9 @@ class ILQRTwoLayerController:
         self.map_received = False
         self.last_replan_time = 0.0
 
+        # 性能指标收集器
+        self.metrics = MetricsCollector(algo_name="iLQR")
+
         # 规划结果
         self.geometric_path = []
         self.smooth_ref = []
@@ -60,12 +65,12 @@ class ILQRTwoLayerController:
         self.global_planner = GlobalPathPlanner(resolution=0.05, inflate_radius=0.25)
         self.traj_generator = TrajectoryGenerator(v_max=self.v_max, v_min=0.05, w_max=2.0, a_max=0.5)
         self.ilqr = ILQRTracker(
-            dt=self.dt, N=self.N, v_max=self.v_max, v_min=0.0, w_max=1.0,  # 降低 w_max 防止剧烈转向
-            Q_pos=120.0,   # 位置权重（最重要）
-            Q_theta=1.0,   # 大幅降低角度权重，让它自然跟随
+            dt=self.dt, N=self.N, v_max=self.v_max, v_min=0.0, w_max=1.0,
+            Q_pos=80.0,    # 降低位置权重
+            Q_theta=30.0,  # 大幅提高朝向权重，让机器人对齐路径方向
             Q_v=2.0,       # 速度跟踪
             R_v=0.1,       # 控制平滑
-            R_w=0.5,       # 提高角速度代价，防止来回转
+            R_w=1.0,       # 提高角速度代价，防止来回转
             max_iter=10, reg=0.1, obs_eta=obs_eta, obs_d0=obs_d0
         )
 
@@ -98,6 +103,8 @@ class ILQRTwoLayerController:
         self.smooth_ref = []
         self.last_replan_time = 0
         self.ilqr.reset()
+        # 设置目标并开始记录
+        self.metrics.set_goal(self.current_state[:2], self.goal_pos)
         rospy.loginfo(f"[iLQR] New goal: ({self.goal_pos[0]:.2f}, {self.goal_pos[1]:.2f})")
 
     def _scan_cb(self, msg):
@@ -125,7 +132,8 @@ class ILQRTwoLayerController:
             return
 
         dist = np.linalg.norm(self.goal_pos - self.current_state[:2])
-        if dist < 0.15:
+        if dist < 0.20:  # 放宽到达判定距离
+            self.metrics.finish(success=True)
             rospy.loginfo("[iLQR] Goal reached!")
             self.goal_pos = None
             self.pub_cmd.publish(Twist())
@@ -148,13 +156,24 @@ class ILQRTwoLayerController:
             return
 
         # iLQR 求解
+        t_start = time.time()
         control, pred_traj = self.ilqr.solve(self.current_state, ref_window, self.obstacle_points)
+        solve_time = time.time() - t_start
 
         # 发布控制
         cmd = Twist()
         cmd.linear.x = float(control[0])
         cmd.angular.z = float(control[1])
         self.pub_cmd.publish(cmd)
+
+        # 记录性能指标
+        ref_point = ref_window[0] if ref_window else None
+        self.metrics.record(
+            pose=self.current_state,
+            control=control,
+            ref_point=ref_point,
+            solve_time=solve_time
+        )
 
         # 可视化
         self._visualize(pred_traj)

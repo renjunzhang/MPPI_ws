@@ -71,7 +71,8 @@ class MPPITracker:
         self.obstacle_points = None
 
         # === 上一帧控制量 (用于平滑性惩罚) ===
-        self.last_action = torch.zeros(2, device=self.device, dtype=torch.float32)
+        # 初始化为 None，第一帧不计算平滑性惩罚
+        self.last_action = None
 
         # === 死区参数 ===
         self.position_deadband = rospy.get_param("~position_deadband", 0.05)  # 5cm
@@ -79,14 +80,14 @@ class MPPITracker:
 
         # === Critics 权重 (可调参数) ===
         self.weights = {
-            'path_follow': rospy.get_param("~w_path_follow", 50.0),   # 路径跟随
-            'path_align': rospy.get_param("~w_path_align", 30.0),     # 朝向对齐
-            'goal_dist': rospy.get_param("~w_goal_dist", 20.0),       # 目标距离
+            'path_follow': rospy.get_param("~w_path_follow", 60.0),   # 路径跟随 (提高)
+            'path_align': rospy.get_param("~w_path_align", 40.0),     # 朝向对齐
+            'goal_dist': rospy.get_param("~w_goal_dist", 30.0),       # 目标距离 (提高)
             'velocity': rospy.get_param("~w_velocity", 5.0),          # 速度跟踪
-            'angular': rospy.get_param("~w_angular", 1.0),            # 角速度惩罚
-            'obstacle': rospy.get_param("~w_obstacle", 100.0),        # 障碍物
+            'angular': rospy.get_param("~w_angular", 5.0),            # 角速度惩罚 (降低，让它能转)
+            'obstacle': rospy.get_param("~w_obstacle", 100.0),        # 障碑物
             'constraint': rospy.get_param("~w_constraint", 500.0),    # 约束违反
-            'smoothness': rospy.get_param("~w_smoothness", 30.0),     # 控制平滑性 (新增)
+            'smoothness': rospy.get_param("~w_smoothness", 50.0),     # 控制平滑性 (降低，之前150太高)
         }
 
         # === APF 参数 (障碍物斥力) ===
@@ -96,10 +97,10 @@ class MPPITracker:
         rospy.loginfo(f"[MPPITracker] Critics weights: {self.weights}")
         rospy.loginfo(f"[MPPITracker] Deadband: pos={self.position_deadband}m, ang={np.degrees(self.angle_deadband):.1f}deg")
 
-        # === MPPI 噪声设置 ===
+        # === MPPI 噪声设置 (增大角速度噪声，让它能探索更大的转向) ===
         noise_sigma = torch.tensor([
-            [0.08, 0.0],
-            [0.0, 0.6]
+            [0.1, 0.0],   # 速度噪声
+            [0.0, 0.8]    # 角速度噪声
         ], device=self.device, dtype=torch.float32)
 
         # === 初始化 MPPI 求解器 (软约束模式) ===
@@ -108,10 +109,10 @@ class MPPITracker:
             self._running_cost,
             nx=3,
             noise_sigma=noise_sigma,
-            num_samples=1000,
+            num_samples=800,    # 减少采样数量以加快计算
             horizon=self.N,
             device=self.device,
-            lambda_=0.02,
+            lambda_=0.01,
             # 软约束: 扩大范围，让优化器学会约束
             u_min=torch.tensor([self.v_min - 0.1, -self.w_max - 0.5], device=self.device, dtype=torch.float32),
             u_max=torch.tensor([self.v_max + 0.1, self.w_max + 0.5], device=self.device, dtype=torch.float32)
@@ -371,6 +372,10 @@ class MPPITracker:
 
         惩罚控制量相对于上一帧的变化，防止抖动
         """
+        # 第一帧没有上一帧控制量，不计算平滑性惩罚
+        if self.last_action is None:
+            return torch.zeros(action.shape[0], device=self.device)
+        
         # 角速度变化惩罚 (主要防止方向抖动)
         w = action[:, 1]
         w_change = (w - self.last_action[1]) ** 2
@@ -431,6 +436,8 @@ class MPPITracker:
         w = float(torch.clamp(action[1], -self.w_max, self.w_max).item())
 
         # 6. 更新上一帧控制量 (用于平滑性惩罚)
+        if self.last_action is None:
+            self.last_action = torch.zeros(2, device=self.device, dtype=torch.float32)
         self.last_action[0] = v
         self.last_action[1] = w
 
@@ -466,7 +473,8 @@ class MPPITracker:
     def reset(self):
         """重置 MPPI 内部状态"""
         self.mppi.reset()
-        self.last_action = torch.zeros(2, device=self.device, dtype=torch.float32)
+        # 重置为 None，这样第一帧不会有平滑性惩罚
+        self.last_action = None
 
     def set_costmap(self, grid, resolution, origin):
         """
