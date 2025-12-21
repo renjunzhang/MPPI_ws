@@ -1,0 +1,53 @@
+<launch>
+    <param name="/use_sim_time" value="true" />
+
+    <!-- TF: map -> odom -->
+    <node pkg="tf" type="static_transform_publisher" name="map_odom_broadcaster"
+          args="0 0 0 0 0 0 map odom 100" />
+
+    <!-- 注意: Ridgeback 仿真环境是空旷世界，没有预设地图 -->
+    <!-- 如果有地图文件，取消下面的注释 -->
+    <!-- <node name="map_server" pkg="map_server" type="map_server"
+          args="$(find simple_mppi)/maps/map.yaml">
+        <param name="frame_id" value="map"/>
+    </node> -->
+
+    <!-- 全向移动 MPPI 控制器 (Ridgeback) -->
+    <node name="mppi_ridgeback_controller" pkg="simple_mppi" type="mppi_ridgeback.py" output="screen">
+        <!-- 无地图模式: 当没有静态地图时，使用直线路径 + 激光避障 -->
+        <param name="mapless_mode" value="true"/>
+
+        <!-- PathHandler 参数 -->
+        <param name="lookahead_dist" value="0.5"/>
+        <param name="prune_distance" value="0.2"/>
+        <param name="v_ref" value="0.3"/>
+
+        <!-- Ridgeback 话题重映射 -->
+        <remap from="/odom" to="/odometry/filtered"/>
+        <remap from="/scan" to="/front/scan"/>
+        <remap from="/cmd_vel" to="/cmd_vel"/>
+
+        <!-- Critics 权重 -->
+        <param name="w_path_follow" value="50.0"/>
+        <param name="w_path_align" value="20.0"/>
+        <param name="w_goal_dist" value="30.0"/>
+        <param name="w_velocity" value="5.0"/>
+        <param name="w_lateral" value="5.0"/>
+        <param name="w_angular" value="3.0"/>
+        <param name="w_obstacle" value="150.0"/>
+        <param name="w_constraint" value="500.0"/>
+
+        <!-- 全向移动速度限制 -->
+        <param name="vx_max" value="0.5"/>
+        <param name="vy_max" value="0.5"/>
+        <param name="w_max" value="1.0"/>
+
+        <!-- 障碍物参数 (无地图模式下更重要) -->
+        <param name="obs_d0" value="0.8"/>
+        <param name="obs_eta" value="1.5"/>
+    </node>
+
+    <!-- RViz -->
+    <node name="rviz" pkg="rviz" type="rviz"
+          args="-d $(find simple_mppi)/rviz/mppi_ridgeback.rviz"/>
+</launch>
