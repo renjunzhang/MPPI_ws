@@ -1,0 +1,33 @@
+# ========= 通用参数 =========
+robot_base_frame: base_link
+transform_tolerance: 0.5
+
+# ========= 机器人外形（Ridgeback） =========
+footprint: [[0.45, 0.35],
+            [0.45,-0.35],
+            [-0.45,-0.35],
+            [-0.45, 0.35]]
+footprint_padding: 0.03
+
+# ========= 障碍物层 =========
+obstacle_layer:
+  enabled: true
+  observation_sources: laser
+  laser:
+    topic: /front/scan
+    sensor_frame: front_laser
+    data_type: LaserScan
+    marking: true
+    clearing: true
+    obstacle_range: 3.0
+    raytrace_range: 3.5
+
+# ========= 静态地图 =========
+static_layer:
+  enabled: true
+
+# ========= 膨胀层 =========
+inflation_layer:
+  enabled: true
+  inflation_radius: 0.55
+  cost_scaling_factor: 5.0

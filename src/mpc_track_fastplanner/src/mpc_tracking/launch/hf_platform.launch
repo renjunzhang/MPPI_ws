@@ -1,0 +1,136 @@
+<launch>
+  <!-- ========================================================= -->
+  <!--  mpc_track_fastplanner for hf_platform (实物平台)         -->
+  <!--  使用 junjun_bringup 启动底层，本文件启动规划与控制       -->
+  <!-- ========================================================= -->
+  
+  <!-- ========== 关键环境参数 ========== -->
+  <!-- 实机运行：必须禁用仿真时钟 -->
+  <param name="/use_sim_time" value="false"/>
+  
+  <!-- ========== 参数配置 ========== -->
+  
+  <!-- hf_platform 话题配置 -->
+  <arg name="cmd_vel_topic" default="/mpc/cmd_vel_raw"/>  <!-- MPC输出到安全开关 -->
+  <arg name="odom_topic" default="/odom"/>
+  <arg name="cloud_topic" default="/merged_cloud"/>
+  
+  <!-- FastPlanner 地图参数（根据实际场地调整） -->
+  <arg name="map_size_x" default="40.0"/>
+  <arg name="map_size_y" default="40.0"/>
+  <arg name="map_size_z" default="0.5"/>
+  
+  <!-- 速度限制（实物安全值，可根据需要调整） -->
+  <arg name="max_vel" default="0.6"/>  <!-- 最大速度 0.6 m/s -->
+  <arg name="max_acc" default="0.5"/>  <!-- 最大加速度 0.5 m/s² -->
+  
+  
+  <!-- ========== 1. 点云转换节点 ========== -->
+  <!-- 功能：将 /scan_full_filtered (LaserScan) 转换成 PointCloud2 并转到 odom frame -->
+  <!-- 延迟 3 秒启动，等待 TF 树建立 -->
+  <node pkg="lidar2world" name="lidar2world_node" type="lidar2world_node" output="screen" launch-prefix="bash -c 'sleep 3; $0 $@' ">
+    <param name="input_scan_topic" value="/scan_full_filtered"/>
+    <param name="output_cloud_topic" value="/point_cloud_map"/>
+    <param name="target_frame" value="odom"/>
+  </node>
+  
+  
+  <!-- ========== 2. FastPlanner 规划器 ========== -->
+  <include file="$(find plan_manage)/launch/lidar.xml">
+    <!-- 地图参数 -->
+    <arg name="map_size_x_" value="$(arg map_size_x)"/>
+    <arg name="map_size_y_" value="$(arg map_size_y)"/>
+    <arg name="map_size_z_" value="$(arg map_size_z)"/>
+    
+    <!-- 必须的话题参数 -->
+    <arg name="odometry_topic" value="$(arg odom_topic)"/>
+    <arg name="camera_pose_topic" value="/camera/pose"/>  <!-- LiDAR 模式不使用，占位符 -->
+    <arg name="depth_topic" value="/depth"/>       <!-- 不使用深度图，填个占位符 -->
+    <arg name="cloud_topic" value="/point_cloud_map"/>  <!-- 使用转换后的点云 -->
+    
+    <!-- 相机参数（不使用，但 lidar.xml 需要） -->
+    <arg name="cx" value="320.5"/>
+    <arg name="cy" value="240.5"/>
+    <arg name="fx" value="554.25"/>
+    <arg name="fy" value="554.25"/>
+    
+    <!-- 速度约束 -->
+    <arg name="max_vel" value="$(arg max_vel)"/>
+    <arg name="max_acc" value="$(arg max_acc)"/>
+    
+    <!-- 航点参数（不使用自动航点，使用 RViz 2D Nav Goal） -->
+    <arg name="point_num" value="1"/>
+    <arg name="point0_x" value="0.0"/>
+    <arg name="point0_y" value="0.0"/>
+    <arg name="point0_z" value="0.0"/>
+    <arg name="point1_x" value="0.0"/>
+    <arg name="point1_y" value="0.0"/>
+    <arg name="point1_z" value="0.0"/>
+    <arg name="point2_x" value="0.0"/>
+    <arg name="point2_y" value="0.0"/>
+    <arg name="point2_z" value="0.0"/>
+    
+    <!-- 使用 RViz 2D Nav Goal 选择目标点（flight_type=1） -->
+    <arg name="flight_type" value="1"/>
+  </include>
+  
+  
+  <!-- ========== 3. 轨迹服务器 ========== -->
+  <node pkg="plan_manage" name="traj_server" type="traj_server" output="screen">
+    <remap from="/position_cmd" to="/planning/pos_cmd"/>
+    <remap from="/odom_world" to="$(arg odom_topic)"/>
+    <param name="traj_server/time_forward" value="1.5" type="double"/>
+  </node>
+  
+  
+  <!-- ========== 4. 航点生成器 ========== -->
+  <node pkg="waypoint_generator" name="waypoint_generator" type="waypoint_generator" output="screen">
+    <remap from="waypoint_generator/odom" to="$(arg odom_topic)"/>        
+    <remap from="waypoint_generator/goal" to="/move_base_simple/goal"/>
+    <remap from="waypoint_generator/traj_start_trigger" to="/traj_start_trigger"/>
+    <param name="waypoint_type" value="manual-lonely-waypoint"/>    
+  </node>
+  
+  
+  <!-- ========== 5. MPC 跟踪控制器 ========== -->
+  <node pkg="mpc_tracking" name="mpc_tracking_node" type="mpc_tracking_node" output="screen">
+    <!-- 话题重映射 -->
+    <param name="cmd_vel_topic" value="$(arg cmd_vel_topic)"/>
+    <param name="odom_topic" value="$(arg odom_topic)"/>
+    
+    <!-- MPC 控制参数（根据 hf_platform 动力学调整） -->
+    <param name="dt" value="0.1" type="double"/>        <!-- 控制周期 100ms -->
+    <param name="N" value="60" type="int"/>             <!-- 预测地平线 30 步 = 3s -->
+    <param name="max_v_xy" value="0.8" type="double"/>  <!-- 最大速度 0.8 m/s -->
+    <param name="max_a_xy" value="1.0" type="double"/>  <!-- 最大加速度 1.0 m/s² -->
+    
+    <!-- 代价函数权重 -->
+    <param name="w_pos" value="10.0" type="double"/>     <!-- 位置误差权重 -->
+    <param name="w_yaw" value="5.0" type="double"/>     <!-- 航向误差权重 -->
+    <param name="w_u" value="2.0" type="double"/>       <!-- 控制输入权重 -->
+    <param name="w_du" value="50.0" type="double"/>     <!-- 控制增量权重（平滑性） -->
+  </node>
+  
+  
+  <!-- ========== 6. 安全开关节点（紧急停止模式）========== -->
+  <!-- 功能：正常情况下连续转发MPC命令，按下B键立即急停 -->
+  <node pkg="mpc_tracking" name="safety_switch" type="safety_switch_node" output="screen">
+    <param name="stop_button" value="2" type="int"/>  <!-- B键（2号按钮）作为紧急停止键 -->
+    <!-- 正常运行：MPC命令无阻碍转发，适合150kg重型底盘 -->
+    <!-- 急停：按下B键立即停止 -->
+    <!-- 解除：同时按住Start(7) + Back(6)键 -->
+  </node>
+  
+  
+  <!-- ========== 7. RViz 可视化 ========== -->
+  <node pkg="rviz" type="rviz" name="rviz" 
+        args="-d $(find mpc_tracking)/launch/rviz.rviz"  
+        required="false"/>
+  
+  
+  <!-- ========== 系统信息 ========== -->
+  <node pkg="rostopic" type="rostopic" name="system_info" 
+        args="echo -e '\n=== mpc_track_fastplanner for hf_platform ===\n启动成功！在 RViz 中使用 2D Nav Goal 设置目标点\n'" 
+        output="screen" launch-prefix="bash -c 'sleep 3; '"/>
+  
+</launch>

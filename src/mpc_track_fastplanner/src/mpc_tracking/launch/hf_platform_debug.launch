@@ -1,0 +1,118 @@
+<launch>
+  <!-- ========================================================= -->
+  <!--  mpc_track_fastplanner DEBUG MODE (调试模式)              -->
+  <!--  用于测试阶段，MPC 输出到调试话题，不控制底盘             -->
+  <!-- ========================================================= -->
+  
+  <!-- 关键环境参数 -->
+  <param name="/use_sim_time" value="false"/>
+  
+  <!-- ========== 参数配置 ========== -->
+  <arg name="cmd_vel_topic" default="/mpc/debug_cmd_vel"/>  <!-- 调试输出 -->
+  <arg name="odom_topic" default="/odom"/>
+  <arg name="cloud_topic" default="/merged_cloud"/>
+  
+  <arg name="map_size_x" default="20.0"/>
+  <arg name="map_size_y" default="20.0"/>
+  <arg name="map_size_z" default="0.5"/>
+  
+  <arg name="max_vel" default="0.3"/>  <!-- 调试阶段降低速度 -->
+  <arg name="max_acc" default="0.3"/>
+  
+  
+  <!-- ========== 1. 点云转换节点 ========== -->
+  <!-- 延迟 3 秒启动，等待 TF 树建立 -->
+  <node pkg="lidar2world" name="lidar2world_node" type="lidar2world_node" output="screen" launch-prefix="bash -c 'sleep 3; $0 $@' ">
+    <param name="input_cloud_topic" value="$(arg cloud_topic)"/>
+    <param name="output_cloud_topic" value="/point_cloud_map"/>
+    <param name="target_frame" value="odom"/>
+  </node>
+  
+  
+  <!-- ========== 2. FastPlanner 规划器 ========== -->
+  <include file="$(find plan_manage)/launch/lidar.xml">
+    <!-- 地图参数 -->
+    <arg name="map_size_x_" value="$(arg map_size_x)"/>
+    <arg name="map_size_y_" value="$(arg map_size_y)"/>
+    <arg name="map_size_z_" value="$(arg map_size_z)"/>
+    
+    <!-- 必须的话题参数 -->
+    <arg name="odometry_topic" value="$(arg odom_topic)"/>
+    <arg name="camera_pose_topic" value="/camera/pose"/>  <!-- LiDAR 模式不使用，占位符 -->
+    <arg name="depth_topic" value="/depth"/>       <!-- 不使用深度图，填个占位符 -->
+    <arg name="cloud_topic" value="/point_cloud_map"/>  <!-- 使用转换后的点云 -->
+    
+    <!-- 相机参数（不使用，但 lidar.xml 需要） -->
+    <arg name="cx" value="320.5"/>
+    <arg name="cy" value="240.5"/>
+    <arg name="fx" value="554.25"/>
+    <arg name="fy" value="554.25"/>
+    
+    <!-- 速度约束 -->
+    <arg name="max_vel" value="$(arg max_vel)"/>
+    <arg name="max_acc" value="$(arg max_acc)"/>
+    
+    <!-- 航点参数（不使用自动航点，使用 RViz 2D Nav Goal） -->
+    <arg name="point_num" value="1"/>
+    <arg name="point0_x" value="0.0"/>
+    <arg name="point0_y" value="0.0"/>
+    <arg name="point0_z" value="0.0"/>
+    <arg name="point1_x" value="0.0"/>
+    <arg name="point1_y" value="0.0"/>
+    <arg name="point1_z" value="0.0"/>
+    <arg name="point2_x" value="0.0"/>
+    <arg name="point2_y" value="0.0"/>
+    <arg name="point2_z" value="0.0"/>
+    
+    <!-- 使用 RViz 2D Nav Goal 选择目标点（flight_type=1） -->
+    <arg name="flight_type" value="1"/>
+  </include>
+  
+  
+  <!-- ========== 3. 轨迹服务器 ========== -->
+  <node pkg="plan_manage" name="traj_server" type="traj_server" output="screen">
+    <remap from="/position_cmd" to="/planning/pos_cmd"/>
+    <remap from="/odom_world" to="$(arg odom_topic)"/>
+    <param name="traj_server/time_forward" value="1.5" type="double"/>
+  </node>
+  
+  
+  <!-- ========== 4. 航点生成器 ========== -->
+  <node pkg="waypoint_generator" name="waypoint_generator" type="waypoint_generator" output="screen">
+    <remap from="waypoint_generator/odom" to="$(arg odom_topic)"/>        
+    <remap from="waypoint_generator/goal" to="/move_base_simple/goal"/>
+    <remap from="waypoint_generator/traj_start_trigger" to="/traj_start_trigger"/>
+    <param name="waypoint_type" value="manual-lonely-waypoint"/>    
+  </node>
+  
+  
+  <!-- ========== 5. MPC 跟踪控制器（调试输出） ========== -->
+  <node pkg="mpc_tracking" name="mpc_tracking_node" type="mpc_tracking_node" output="screen">
+    <param name="cmd_vel_topic" value="$(arg cmd_vel_topic)"/>
+    <param name="odom_topic" value="$(arg odom_topic)"/>
+    
+    <!-- MPC 控制参数 -->
+    <param name="dt" value="0.1" type="double"/>
+    <param name="N" value="30" type="int"/>
+    <param name="max_v_xy" value="0.5" type="double"/>  <!-- 调试阶段限速 -->
+    <param name="max_a_xy" value="0.5" type="double"/>
+    
+    <param name="w_pos" value="8.0" type="double"/>
+    <param name="w_yaw" value="0.2" type="double"/>
+    <param name="w_u" value="1.0" type="double"/>
+    <param name="w_du" value="10.0" type="double"/>
+  </node>
+  
+  
+  <!-- ========== 6. RViz 可视化 ========== -->
+  <node pkg="rviz" type="rviz" name="rviz" 
+        args="-d $(find plan_manage)/launch/rviz_config/rviz.rviz" 
+        required="false"/>
+  
+  
+  <!-- ========== 调试信息提示 ========== -->
+  <node pkg="rostopic" type="rostopic" name="debug_info" 
+        args="echo -e '\n=== DEBUG MODE ===\nMPC 输出到: /mpc/debug_cmd_vel\n不会控制底盘！\n请在 RViz 中检查 /mpc_predict_path 和 /mpc_motion_path\n==================\n'" 
+        output="screen" launch-prefix="bash -c 'sleep 3; '"/>
+  
+</launch>
