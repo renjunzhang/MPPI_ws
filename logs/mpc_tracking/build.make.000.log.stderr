@@ -1,0 +1,16 @@
+In file included from /data/a/MPPI_ws/src/mpc_track_fastplanner/src/mpc_tracking/src/mpc.cpp:1:
+/data/a/MPPI_ws/src/mpc_track_fastplanner/src/mpc_tracking/include/mpc_tracking/mpc.h:5:10: fatal error: Eigen/Eigen: 没有那个文件或目录
+    5 | #include "Eigen/Eigen"
+      |          ^~~~~~~~~~~~~
+compilation terminated.
+make[2]: *** [CMakeFiles/mpc_tracking_node.dir/build.make:76：CMakeFiles/mpc_tracking_node.dir/src/mpc.cpp.o] 错误 1
+make[2]: *** 正在等待未完成的任务....
+In file included from /data/a/MPPI_ws/src/mpc_track_fastplanner/src/mpc_tracking/src/mpc_node.cpp:8:
+/data/a/MPPI_ws/src/mpc_track_fastplanner/src/Fast-Planner/fast_planner/bspline/include/bspline/non_uniform_bspline.h:29:10: fatal error: Eigen/Eigen: 没有那个文件或目录
+   29 | #include <Eigen/Eigen>
+      |          ^~~~~~~~~~~~~
+compilation terminated.
+make[2]: *** [CMakeFiles/mpc_tracking_node.dir/build.make:63：CMakeFiles/mpc_tracking_node.dir/src/mpc_node.cpp.o] 错误 1
+make[1]: *** [CMakeFiles/Makefile2:1775：CMakeFiles/mpc_tracking_node.dir/all] 错误 2
+make[1]: *** 正在等待未完成的任务....
+make: *** [Makefile:141：all] 错误 2

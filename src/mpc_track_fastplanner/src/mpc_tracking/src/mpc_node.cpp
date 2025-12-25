@@ -53,6 +53,10 @@ const double dt = 0.1;
 
 Eigen::Vector3d current_state;
 
+// === 速度方向控制 ===
+bool reverse_vel_x = false;
+bool reverse_vel_y = false;
+
 unique_ptr<Mpc> mpc_ptr;
 
 void bsplineCallback(mpc_tracking::BsplineConstPtr msg) {
@@ -194,10 +198,11 @@ void publish_control_cmd(const ros::TimerEvent &e) {
     ros::Time solve_start = ros::Time::now();
     auto result = mpc_ptr->solve(current_state, desired_state);
     double solve_time_ms = (ros::Time::now() - solve_start).toSec() * 1000.0;
-    
+
     geometry_msgs::Twist cmd;
-    cmd.linear.x = result[0];   // u: forward velocity
-    cmd.linear.y = result[1];   // v: lateral velocity
+    // 应用速度反向开关
+    cmd.linear.x = (reverse_vel_x ? -1.0 : 1.0) * result[0];   // u: forward velocity
+    cmd.linear.y = (reverse_vel_y ? -1.0 : 1.0) * result[1];   // v: lateral velocity
     //cmd.angular.z = result[2];  // r: angular velocity
     cmd_vel_pub.publish(cmd);
     //cout << "u:" << result[0] << " " << "r:" << result[1] << endl;
@@ -270,8 +275,11 @@ int main(int argc, char **argv)
 
     // === 参数化配置（适配 hf_platform） ===
     std::string cmd_vel_topic, odom_topic;
+    bool reverse_vel_x, reverse_vel_y;
     nh.param<std::string>("cmd_vel_topic", cmd_vel_topic, "/hf_platform/twist_mux/cmd_vel");
     nh.param<std::string>("odom_topic", odom_topic, "/odom");
+    nh.param<bool>("reverse_vel_x", reverse_vel_x, false);  // 反向x方向速度
+    nh.param<bool>("reverse_vel_y", reverse_vel_y, false);  // 反向y方向速度
     
     // 发布器
     cmd_vel_pub = nh.advertise<geometry_msgs::Twist>(cmd_vel_topic, 1);
@@ -298,6 +306,8 @@ int main(int argc, char **argv)
     ROS_INFO("[MPC Tracking] Node started with configuration:");
     ROS_INFO("  cmd_vel_topic: %s", cmd_vel_topic.c_str());
     ROS_INFO("  odom_topic: %s", odom_topic.c_str());
+    ROS_INFO("  reverse_vel_x: %s", reverse_vel_x ? "true" : "false");
+    ROS_INFO("  reverse_vel_y: %s", reverse_vel_y ? "true" : "false");
     ROS_INFO("=================================================");
 
     ros::spin();

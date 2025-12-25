@@ -14,6 +14,8 @@ find_package(catkin REQUIRED COMPONENTS
   bspline
   message_generation
 )
+
+find_package(Eigen3 REQUIRED)
 # Generate messages in the 'msg' folder
 add_message_files(
   FILES
@@ -99,6 +101,7 @@ endif()
 ## Specify libraries to link a library or executable target against
  target_link_libraries(${PROJECT_NAME}_node
    ${catkin_LIBRARIES}
+   Eigen3::Eigen
    ipopt
    #dw
  )

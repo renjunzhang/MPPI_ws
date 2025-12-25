@@ -1,0 +1,5 @@
+mpc_track_fastplanner/src/Fast-Planner/fast_planner/bspline
+/data/a/MPPI_ws/devel/.private/bspline/lib/libbspline.so /data/a/MPPI_ws/devel/lib/libbspline.so
+/data/a/MPPI_ws/devel/.private/bspline/lib/pkgconfig/bspline.pc /data/a/MPPI_ws/devel/lib/pkgconfig/bspline.pc
+/data/a/MPPI_ws/devel/.private/bspline/share/bspline/cmake/bsplineConfig.cmake /data/a/MPPI_ws/devel/share/bspline/cmake/bsplineConfig.cmake
+/data/a/MPPI_ws/devel/.private/bspline/share/bspline/cmake/bsplineConfig-version.cmake /data/a/MPPI_ws/devel/share/bspline/cmake/bsplineConfig-version.cmake

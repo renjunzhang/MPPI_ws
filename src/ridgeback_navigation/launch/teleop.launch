@@ -1,0 +1,11 @@
+<launch>
+  <node pkg="ridgeback_navigation" type="teleop_hold.py" name="teleop_hold" output="screen">
+    <param name="cmd_vel_topic" value="/cmd_vel"/>
+    <param name="rate" value="20.0"/>
+    <param name="timeout" value="0.5"/>
+    <param name="lin_step" value="0.05"/>
+    <param name="ang_step" value="0.1"/>
+    <param name="lin_scale" value="0.3"/>
+    <param name="ang_scale" value="0.6"/>
+  </node>
+</launch>

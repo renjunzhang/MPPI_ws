@@ -1,0 +1,4 @@
+/data/a/MPPI_ws/src/mpc_track_fastplanner/src/Fast-Planner/fast_planner/bspline/src/non_uniform_bspline.cpp: In member function ‘bool fast_planner::NonUniformBspline::checkFeasibility(bool)’:
+/data/a/MPPI_ws/src/mpc_track_fastplanner/src/Fast-Planner/fast_planner/bspline/src/non_uniform_bspline.cpp:186:10: warning: unused variable ‘ratio’ [-Wunused-variable]
+  186 |   double ratio = max(max_vel / limit_vel_, sqrt(fabs(max_acc) / limit_acc_));
+      |          ^~~~~

@@ -1,0 +1,8 @@
+/data/a/MPPI_ws/src/mpc_track_fastplanner/src/Fast-Planner/fast_planner/plan_env/src/obj_predictor.cpp: In member function ‘void fast_planner::ObjHistory::poseCallback(const PoseStampedConstPtr&)’:
+/data/a/MPPI_ws/src/mpc_track_fastplanner/src/Fast-Planner/fast_planner/plan_env/src/obj_predictor.cpp:53:23: warning: comparison of integer expressions of different signedness: ‘std::__cxx11::list<Eigen::Matrix<double, 4, 1> >::size_type’ {aka ‘long unsigned int’} and ‘int’ [-Wsign-compare]
+   53 |   if (history_.size() > queue_size_) history_.pop_front();
+      |       ~~~~~~~~~~~~~~~~^~~~~~~~~~~~~
+/data/a/MPPI_ws/src/mpc_track_fastplanner/src/Fast-Planner/fast_planner/plan_env/src/edt_environment.cpp: In member function ‘double fast_planner::EDTEnvironment::minDistToAllBox(const Vector3d&, const double&)’:
+/data/a/MPPI_ws/src/mpc_track_fastplanner/src/Fast-Planner/fast_planner/plan_env/src/edt_environment.cpp:66:21: warning: comparison of integer expressions of different signedness: ‘int’ and ‘std::vector<fast_planner::PolynomialPrediction>::size_type’ {aka ‘long unsigned int’} [-Wsign-compare]
+   66 |   for (int i = 0; i < obj_prediction_->size(); i++) {
+      |                   ~~^~~~~~~~~~~~~~~~~~~~~~~~~
